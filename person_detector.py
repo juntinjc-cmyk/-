@@ -49,6 +49,10 @@ def build_parser():
                    help="追蹤：已經在追的人，信心掉到多低還繼續跟（預設 0.2）")
     p.add_argument("--smooth", type=float, default=0.7,
                    help="追蹤：框的平滑程度，0~1。越大越跟手、越小越穩（預設 0.7）")
+    p.add_argument("--min-height", type=float, default=0.0,
+                   help="框的高度小於畫面這個比例就不顯示（過濾太遠的人），例如 0.08；預設 0 不過濾")
+    p.add_argument("--max-boxes", type=int, default=0,
+                   help="最多只顯示幾個框（留最大、最近的），例如 10；預設 0 不限制")
     p.add_argument("--ignore", type=float, nargs=4, action="append",
                    metavar=("X1", "Y1", "X2", "Y2"),
                    help="忽略區域（用畫面比例 0~1 表示）：框的中心落在這裡就不顯示。可以寫多次。"
@@ -128,23 +132,28 @@ def iou_matrix(a, b):
 
 
 class BoxTracker:
-    """簡單的追蹤器，讓框在快速運動時不閃爍、不跳動。
+    """簡單的追蹤器，讓框在快速運動時不閃爍、不跳動，也不要太雜亂。
 
-    - 雙門檻：新出現的人要信心 >= high 才開始顯示；已經在追蹤的人，
+    - 雙門檻：新出現的人要信心 >= high 才開始追；已經在追蹤的人，
       畫面糊掉分數變低（>= track_low）也繼續跟著。
-    - 暫時抓不到時，依照之前的移動速度把框往前推，最多撐 hold 幀才消失。
+    - 新的人要連續被看到 min_hits 次才顯示，過濾只出現一瞬間的誤判。
+    - 暫時抓不到時，框短暫沿原方向移動後就停住，最多撐 hold 幀才消失（不會到處飄）。
+    - 跟現有框幾乎重疊的偵測，不會再開一個新框（避免同一個人兩個框）。
     - 位置做平滑處理，減少每幀的小抖動；smooth 越大越跟手、越小越穩。
     """
 
-    def __init__(self, high=0.4, hold=8, smooth=0.7, match_iou=0.2):
+    def __init__(self, high=0.4, hold=8, smooth=0.7, match_iou=0.2, min_hits=2, dup_iou=0.5):
         self.high = high
         self.hold = hold
         self.smooth = smooth
         self.match_iou = match_iou
+        self.min_hits = min_hits
+        self.dup_iou = dup_iou
         self.boxes = np.zeros((0, 4), dtype=np.float32)
         self.vel = np.zeros((0, 4), dtype=np.float32)
         self.conf = np.zeros((0,), dtype=np.float32)
         self.misses = np.zeros((0,), dtype=np.int32)
+        self.hits = np.zeros((0,), dtype=np.int32)
 
     def update(self, det, det_conf, h, w):
         det = det.astype(np.float32)
@@ -177,33 +186,70 @@ class BoxTracker:
             self.boxes[t] = new
             self.conf[t] = det_conf[d]
             self.misses[t] = 0
+            self.hits[t] += 1
 
-        # 沒配到的追蹤對象：沿著速度繼續走，速度逐漸減慢
+        # 沒配到的追蹤對象：沿原方向短暫移動，速度很快歸零（停住，不會飄走）
         lost = np.ones(len(self.boxes), dtype=bool)
         lost[matched_t] = False
         self.boxes[lost] = pred[lost]
-        self.vel[lost] *= 0.8
+        self.vel[lost] *= 0.5
         self.misses[lost] += 1
 
-        # 沒配到的偵測框：信心夠高才當成新的人
-        new_d = [d for d in range(len(det)) if d not in matched_d and det_conf[d] >= self.high]
-        if new_d:
-            self.boxes = np.concatenate([self.boxes, det[new_d]])
-            self.vel = np.concatenate([self.vel, np.zeros((len(new_d), 4), np.float32)])
-            self.conf = np.concatenate([self.conf, det_conf[new_d].astype(np.float32)])
-            self.misses = np.concatenate([self.misses, np.zeros(len(new_d), np.int32)])
+        # 沒配到的偵測框：信心夠高、而且沒有跟現有的框大幅重疊，才當成新的人
+        cand = [d for d in range(len(det)) if d not in matched_d and det_conf[d] >= self.high]
+        if cand and len(self.boxes):
+            overlap = iou_matrix(det[cand], self.boxes).max(axis=1)
+            cand = [d for d, o in zip(cand, overlap) if o < self.dup_iou]
+        if cand:
+            n = len(cand)
+            self.boxes = np.concatenate([self.boxes, det[cand]])
+            self.vel = np.concatenate([self.vel, np.zeros((n, 4), np.float32)])
+            self.conf = np.concatenate([self.conf, det_conf[cand].astype(np.float32)])
+            self.misses = np.concatenate([self.misses, np.zeros(n, np.int32)])
+            self.hits = np.concatenate([self.hits, np.ones(n, np.int32)])
 
         # 太久沒抓到、或已經跑出畫面的就刪掉
         b = self.boxes
         inside = (b[:, 2] > 0) & (b[:, 0] < w) & (b[:, 3] > 0) & (b[:, 1] < h)
         alive = (self.misses <= self.hold) & inside
-        self.boxes, self.vel = self.boxes[alive], self.vel[alive]
-        self.conf, self.misses = self.conf[alive], self.misses[alive]
+        self._keep(alive)
 
-        out = self.boxes.copy()
+        # 兩個追蹤框幾乎重疊（同一個人被追了兩次）：留下比較穩定的那個
+        if len(self.boxes) > 1:
+            order = np.lexsort((-self.hits, self.misses))  # 先看最近有沒有抓到，再看追了多久
+            iou = iou_matrix(self.boxes, self.boxes)
+            keep = np.ones(len(self.boxes), dtype=bool)
+            for i_pos, i in enumerate(order):
+                if not keep[i]:
+                    continue
+                for j in order[i_pos + 1:]:
+                    if keep[j] and iou[i, j] > self.dup_iou:
+                        keep[j] = False
+            self._keep(keep)
+
+        show = self.hits >= self.min_hits
+        out = self.boxes[show].copy()
         out[:, 0::2] = np.clip(out[:, 0::2], 0, w - 1)
         out[:, 1::2] = np.clip(out[:, 1::2], 0, h - 1)
-        return out.round().astype(np.int32), self.conf.copy()
+        return out.round().astype(np.int32), self.conf[show].copy()
+
+    def _keep(self, mask):
+        self.boxes, self.vel = self.boxes[mask], self.vel[mask]
+        self.conf, self.misses, self.hits = self.conf[mask], self.misses[mask], self.hits[mask]
+
+
+def limit_boxes(xyxy, confs, h, min_height, max_boxes):
+    """過濾太小（太遠）的框，以及只保留最大的幾個框，讓畫面不要太雜。"""
+    if len(xyxy) == 0:
+        return xyxy, confs
+    if min_height > 0:
+        keep = (xyxy[:, 3] - xyxy[:, 1]) >= h * min_height
+        xyxy, confs = xyxy[keep], confs[keep]
+    if max_boxes > 0 and len(xyxy) > max_boxes:
+        area = (xyxy[:, 2] - xyxy[:, 0]) * (xyxy[:, 3] - xyxy[:, 1])
+        idx = np.argsort(-area)[:max_boxes]
+        xyxy, confs = xyxy[idx], confs[idx]
+    return xyxy, confs
 
 
 DEFAULT_IGNORE = [(0.0, 0.65, 0.11, 1.0)]  # 左下角（使用者指定的範圍）
@@ -310,6 +356,8 @@ class Detector:
         self.tracker = None if args.no_track else BoxTracker(
             high=args.conf, hold=args.hold, smooth=args.smooth)
         self.keep_self = args.keep_self
+        self.min_height = args.min_height
+        self.max_boxes = args.max_boxes
         self.ignore = [] if args.no_ignore else (args.ignore or DEFAULT_IGNORE)
         if self.ignore:
             print(f"[資訊] 忽略區域（畫面比例）: {self.ignore}")
@@ -394,6 +442,7 @@ class Detector:
             xyxy, confs = filter_self(xyxy, confs, frame.shape[0], frame.shape[1], self.self_top)
         if self.tracker is not None:
             xyxy, confs = self.tracker.update(xyxy, confs, frame.shape[0], frame.shape[1])
+        xyxy, confs = limit_boxes(xyxy, confs, frame.shape[0], self.min_height, self.max_boxes)
         return xyxy, confs
 
 
