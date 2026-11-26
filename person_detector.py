@@ -91,6 +91,7 @@ def main():
     device = args.device if args.device is not None else (0 if use_cuda else "cpu")
     half = use_cuda and str(device) != "cpu"  # GPU 上用 FP16 加速
     print(f"[資訊] 裝置: {'CUDA - ' + torch.cuda.get_device_name(0) if half else 'CPU'}")
+    print(f"[資訊] PyTorch {torch.__version__}，CUDA {torch.version.cuda}")
     if not half:
         print("[警告] 沒有使用 GPU，60 FPS 基本上跑不到。請安裝 CUDA 版 PyTorch。")
 
@@ -115,42 +116,55 @@ def main():
     fps_ema = 0.0
     last = time.perf_counter()
     last_print = last
+    # 每秒統計各階段平均花多少毫秒，用來找出是哪裡拖慢 FPS
+    t_cap = t_inf = t_show = 0.0
+    n = 0
 
     try:
         while True:
+            t0 = time.perf_counter()
             frame = camera.get_latest_frame()
             if frame is None:
                 continue
+            t1 = time.perf_counter()
 
             result = model.predict(frame, classes=[PERSON_CLASS_ID], conf=args.conf,
                                    imgsz=args.imgsz, device=device, half=half,
                                    verbose=False)[0]
             boxes = result.boxes.xyxy.cpu().numpy().astype(int)
             confs = result.boxes.conf.cpu().numpy()
+            t2 = time.perf_counter()
 
-            now = time.perf_counter()
-            dt = now - last
-            last = now
+            if not args.no_show:
+                view = np.ascontiguousarray(frame)  # 確保 OpenCV 可以直接在上面畫
+                draw_boxes(view, boxes, confs)
+                cv2.putText(view, f"FPS {fps_ema:5.1f} | persons {len(boxes)}", (10, 30),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 255), 2, cv2.LINE_AA)
+                if args.show_scale != 1.0:
+                    view = cv2.resize(view, None, fx=args.show_scale, fy=args.show_scale,
+                                      interpolation=cv2.INTER_LINEAR)
+                cv2.imshow(WINDOW_NAME, view)
+                key = cv2.waitKey(1) & 0xFF
+                if key in (ord("q"), 27):
+                    break
+            t3 = time.perf_counter()
+
+            t_cap += t1 - t0
+            t_inf += t2 - t1
+            t_show += t3 - t2
+            n += 1
+
+            dt = t3 - last
+            last = t3
             fps_ema = (1.0 / dt) if fps_ema == 0 else fps_ema * 0.9 + (1.0 / dt) * 0.1
 
-            if args.no_show:
-                if now - last_print >= 1.0:
-                    print(f"FPS: {fps_ema:5.1f}  人數: {len(boxes)}")
-                    last_print = now
-                continue
-
-            view = np.ascontiguousarray(frame)  # 確保 OpenCV 可以直接在上面畫
-            draw_boxes(view, boxes, confs)
-            cv2.putText(view, f"FPS {fps_ema:5.1f} | persons {len(boxes)}", (10, 30),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 255), 2, cv2.LINE_AA)
-            if args.show_scale != 1.0:
-                view = cv2.resize(view, None, fx=args.show_scale, fy=args.show_scale,
-                                  interpolation=cv2.INTER_LINEAR)
-            cv2.imshow(WINDOW_NAME, view)
-
-            key = cv2.waitKey(1) & 0xFF
-            if key in (ord("q"), 27):
-                break
+            if t3 - last_print >= 1.0:
+                print(f"FPS {fps_ema:5.1f} | 擷取等待 {t_cap / n * 1000:5.1f} ms"
+                      f" | 偵測 {t_inf / n * 1000:5.1f} ms"
+                      f" | 畫框顯示 {t_show / n * 1000:5.1f} ms | 人數 {len(boxes)}")
+                t_cap = t_inf = t_show = 0.0
+                n = 0
+                last_print = t3
     except KeyboardInterrupt:
         pass
     finally:
