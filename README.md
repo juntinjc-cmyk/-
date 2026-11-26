@@ -44,6 +44,14 @@ python person_detector.py
 python person_overlay.py --model yolo11n.engine
 ```
 
+要錄影（OBS、Windows 剪取工具等）時，加上 `--recordable`，錄影軟體才錄得到框：
+
+```bash
+python person_overlay.py --model yolo11n.engine --recordable
+```
+
+預設不加的話，框只有你眼睛看得到，錄影錄不到。
+
 要結束：回到終端機按 `Ctrl + C`。參數跟 `person_detector.py` 相同（`--imgsz`、`--conf`、`--fps` 等）。
 
 注意：Netflix 等有 DRM 保護的影片，在某些瀏覽器擷取到的會是黑畫面，這時偵測不到人；YouTube 一般沒有這個問題。

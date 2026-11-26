@@ -2,11 +2,15 @@
 螢幕疊加版人物偵測：不開預覽視窗，綠框直接畫在螢幕上（例如看 YouTube 影片時）。
 
 - 透明、置頂、滑鼠點得穿的視窗蓋在整個螢幕上，只畫框。
-- 疊加視窗會被排除在螢幕擷取之外，所以框不會被下一幀再偵測到。
+- 預設：疊加視窗會被排除在螢幕擷取之外，所以框不會被下一幀再偵測到，
+  但錄影軟體（OBS、剪取工具）也錄不到框。
+- 加 --recordable：錄影軟體錄得到框。代價是框也會被 dxcam 擷取進偵測畫面，
+  通常不影響偵測人物。
 - 疊加畫面由 Windows 桌面合成器（DWM）在顯示卡上合成。
 
 用法：
     python person_overlay.py --model yolo11n.engine
+    python person_overlay.py --model yolo11n.engine --recordable   # 要錄影時
 
 結束：回到終端機按 Ctrl + C。
 """
@@ -130,12 +134,18 @@ def pick_screen(index):
 
 
 def main():
-    args = build_parser().parse_args()
+    parser = build_parser()
+    parser.add_argument("--recordable", action="store_true",
+                        help="讓錄影軟體也錄得到框（框也會被偵測程式看到）")
+    args = parser.parse_args()
 
     app = QApplication(sys.argv)
     overlay = Overlay(pick_screen(args.monitor))
     overlay.show()
-    exclude_hwnd_from_capture(int(overlay.winId()))
+    if args.recordable:
+        print("[資訊] 可錄影模式：錄影軟體錄得到框")
+    else:
+        exclude_hwnd_from_capture(int(overlay.winId()))
 
     worker = DetectorThread(args)
     worker.detections.connect(overlay.set_boxes)  # 跨執行緒，Qt 會自動排到主執行緒執行
