@@ -1,0 +1,5 @@
+__pycache__/
+*.pt
+runs/
+results/
+captured_frames/
