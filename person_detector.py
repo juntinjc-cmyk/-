@@ -49,6 +49,11 @@ def build_parser():
                    help="追蹤：已經在追的人，信心掉到多低還繼續跟（預設 0.2）")
     p.add_argument("--smooth", type=float, default=0.7,
                    help="追蹤：框的平滑程度，0~1。越大越跟手、越小越穩（預設 0.7）")
+    p.add_argument("--ignore", type=float, nargs=4, action="append",
+                   metavar=("X1", "Y1", "X2", "Y2"),
+                   help="忽略區域（用畫面比例 0~1 表示）：框的中心落在這裡就不顯示。可以寫多次。"
+                        "預設是左下角 0 0.78 0.45 1（遊戲介面的血量小人）")
+    p.add_argument("--no-ignore", action="store_true", help="不使用任何忽略區域")
     p.add_argument("--keep-self", action="store_true",
                    help="不要過濾第一人稱畫面下方的手（預設會過濾）")
     p.add_argument("--self-top", type=float, default=0.5,
@@ -201,6 +206,21 @@ class BoxTracker:
         return out.round().astype(np.int32), self.conf.copy()
 
 
+DEFAULT_IGNORE = [(0.0, 0.78, 0.45, 1.0)]  # 左下角
+
+
+def filter_ignore(xyxy, confs, h, w, regions):
+    """框的中心落在任何一個忽略區域（畫面比例）裡，就拿掉。"""
+    if len(xyxy) == 0 or not regions:
+        return xyxy, confs
+    cx = (xyxy[:, 0] + xyxy[:, 2]) / 2 / w
+    cy = (xyxy[:, 1] + xyxy[:, 3]) / 2 / h
+    drop = np.zeros(len(xyxy), dtype=bool)
+    for x1, y1, x2, y2 in regions:
+        drop |= (cx >= x1) & (cx <= x2) & (cy >= y1) & (cy <= y2)
+    return xyxy[~drop], confs[~drop]
+
+
 class GpuPreprocessor:
     """把螢幕畫面轉成模型輸入，重活交給 GPU。
 
@@ -290,6 +310,9 @@ class Detector:
         self.tracker = None if args.no_track else BoxTracker(
             high=args.conf, hold=args.hold, smooth=args.smooth)
         self.keep_self = args.keep_self
+        self.ignore = [] if args.no_ignore else (args.ignore or DEFAULT_IGNORE)
+        if self.ignore:
+            print(f"[資訊] 忽略區域（畫面比例）: {self.ignore}")
         self.self_top = args.self_top
         self.iou = 0.7          # 跟 ultralytics 預設一樣
         self.max_det = 300
@@ -366,6 +389,7 @@ class Detector:
     def __call__(self, frame):
         """回傳 (框 xyxy 整數陣列, 信心分數陣列)。self.speed 記錄前處理 / 推論 / 後處理毫秒數。"""
         xyxy, confs = self._predict_fast(frame) if self.fast else self._predict_ultralytics(frame)
+        xyxy, confs = filter_ignore(xyxy, confs, frame.shape[0], frame.shape[1], self.ignore)
         if not self.keep_self:
             xyxy, confs = filter_self(xyxy, confs, frame.shape[0], frame.shape[1], self.self_top)
         if self.tracker is not None:

@@ -78,6 +78,16 @@ python person_overlay.py --model yolo11n.engine --imgsz 736 1280 --recordable
 - 前面的人被誤刪：把 `--self-top` 調大，例如 `--self-top 0.65`
 - 不是第一人稱、不想過濾：加 `--keep-self`
 
+## 忽略區域（遊戲介面等誤判）
+
+預設忽略左下角（畫面寬 0~45%、高 78~100%），框的中心落在這裡就不顯示，用來避開遊戲介面上的血量小人。數字是畫面比例（0~1）：
+
+```bash
+python person_overlay.py ... --ignore 0 0.7 0.5 1            # 自訂範圍
+python person_overlay.py ... --ignore 0 0.78 0.45 1 --ignore 0.8 0 1 0.2   # 多個區域
+python person_overlay.py ... --no-ignore                      # 不忽略
+```
+
 ## 快速運動時框閃爍
 
 預設開啟追蹤：
