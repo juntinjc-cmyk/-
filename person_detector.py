@@ -42,6 +42,11 @@ def build_parser():
     p.add_argument("--device", default=None, help="例如 0（第一張 GPU）或 cpu；預設自動選擇")
     p.add_argument("--show-scale", type=float, default=0.5, help="預覽視窗縮放比例")
     p.add_argument("--no-show", action="store_true", help="不顯示預覽視窗")
+    p.add_argument("--keep-self", action="store_true",
+                   help="不要過濾第一人稱畫面下方的手（預設會過濾）")
+    p.add_argument("--self-top", type=float, default=0.5,
+                   help="過濾手的靈敏度：碰到畫面底部、且頂端低於畫面這個高度比例的框會被當成自己的手。"
+                        "預設 0.5（畫面一半）；手還是被框到就調小，例如 0.35")
     p.add_argument("--cpu-preprocess", action="store_true",
                    help="改用 ultralytics 原本的完整流程（較慢；快速流程有問題時才用）")
     return p
@@ -80,14 +85,22 @@ def exclude_window_from_capture(title):
 
 
 def draw_boxes(frame, boxes, confs):
-    for (x1, y1, x2, y2), c in zip(boxes, confs):
-        cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 255, 0), 2)
-        label = "person"
-        (tw, th), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 1)
-        y_text = max(y1, th + 4)
-        cv2.rectangle(frame, (x1, y_text - th - 4), (x1 + tw + 4, y_text), (0, 255, 0), -1)
-        cv2.putText(frame, label, (x1 + 2, y_text - 3),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 0), 1, cv2.LINE_AA)
+    for x1, y1, x2, y2 in boxes:  # 只畫框，不畫文字
+        cv2.rectangle(frame, (int(x1), int(y1)), (int(x2), int(y2)), (0, 255, 0), 2)
+
+
+def filter_self(xyxy, confs, h, w, self_top):
+    """第一人稱畫面：去掉拍攝者自己露出來的手、手臂。
+
+    判斷方式：框碰到畫面最底部，而且框的頂端在畫面下方（低於 self_top 的高度比例）。
+    真正站在前面的人，框通常會從畫面中上方開始，不會被誤刪。
+    """
+    if len(xyxy) == 0:
+        return xyxy, confs
+    touches_bottom = xyxy[:, 3] >= h * 0.97
+    starts_low = xyxy[:, 1] >= h * self_top
+    keep = ~(touches_bottom & starts_low)
+    return xyxy[keep], confs[keep]
 
 
 class GpuPreprocessor:
@@ -174,6 +187,8 @@ class Detector:
                 self.kwargs["half"] = True
 
         self.conf = args.conf
+        self.keep_self = args.keep_self
+        self.self_top = args.self_top
         self.iou = 0.7          # 跟 ultralytics 預設一樣
         self.max_det = 300
 
@@ -248,9 +263,10 @@ class Detector:
 
     def __call__(self, frame):
         """回傳 (框 xyxy 整數陣列, 信心分數陣列)。self.speed 記錄前處理 / 推論 / 後處理毫秒數。"""
-        if self.fast:
-            return self._predict_fast(frame)
-        return self._predict_ultralytics(frame)
+        xyxy, confs = self._predict_fast(frame) if self.fast else self._predict_ultralytics(frame)
+        if not self.keep_self:
+            xyxy, confs = filter_self(xyxy, confs, frame.shape[0], frame.shape[1], self.self_top)
+        return xyxy, confs
 
 
 def main():

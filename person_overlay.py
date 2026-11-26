@@ -35,7 +35,6 @@ from PySide6.QtWidgets import QApplication, QWidget
 
 BOX_COLOR = QColor(0, 255, 0)
 KEY_COLOR = QColor(0, 0, 0)          # 純黑 = 透明，畫面上其他地方都不能用純黑
-LABEL_TEXT_COLOR = QColor(12, 12, 12)
 HUD_BG_COLOR = QColor(24, 24, 24)
 HUD_INTERVAL = 0.25                  # 左上角 FPS 每 0.25 秒更新一次就夠了
 
@@ -154,11 +153,10 @@ class Overlay(QWidget):
                      int((x2 - x1 + 2 * pad) / dpr) + 2, int((y2 - y1 + 2 * pad) / dpr) + 2)
 
     def _region_for(self, boxes):
-        """只算框的四條邊和標籤（不是整個框的內部），換成 Qt 的邏輯座標。"""
-        label_h = 40
+        """只算框的四條邊（不是整個框的內部），換成 Qt 的邏輯座標。"""
         region = QRegion()
         for x1, y1, x2, y2, _ in boxes:
-            region += self._to_logical(x1, y1 - label_h, max(x2, x1 + 260), y1 + label_h)  # 上邊 + 標籤
+            region += self._to_logical(x1, y1, x2, y1)                            # 上邊
             region += self._to_logical(x1, y2, x2, y2)                            # 下邊
             region += self._to_logical(x1, y1, x1, y2)                            # 左邊
             region += self._to_logical(x2, y1, x2, y2)                            # 右邊
@@ -188,22 +186,10 @@ class Overlay(QWidget):
         p.scale(1.0 / dpr, 1.0 / dpr)
 
         p.setPen(QPen(BOX_COLOR, 3))
-        font = QFont()
-        font.setPixelSize(22)
-        p.setFont(font)
-        fm = p.fontMetrics()
-
-        for x1, y1, x2, y2, c in self.boxes:
-            p.setPen(QPen(BOX_COLOR, 3))
-            p.setBrush(Qt.NoBrush)
+        p.setBrush(Qt.NoBrush)
+        for x1, y1, x2, y2, _ in self.boxes:   # 只畫框，不畫文字
             p.drawRect(x1, y1, x2 - x1, y2 - y1)
-
-            label = "person"
-            tw, th = fm.horizontalAdvance(label) + 8, fm.height() + 4
-            ty = max(y1 - th, 0)
-            p.fillRect(QRect(x1, ty, tw, th), BOX_COLOR)
-            p.setPen(LABEL_TEXT_COLOR)
-            p.drawText(QRect(x1, ty, tw, th), Qt.AlignCenter, label)
+        font = QFont()
 
         # 左上角顯示 FPS 和人數（fps < 0 代表已停止，不顯示）
         if self.hud_fps >= 0:

@@ -70,6 +70,14 @@ python person_overlay.py --model yolo11n.engine --imgsz 736 1280 --recordable
 - 還想更準：把 `yolo11n.pt` 換成 `yolo11s.pt`（轉出來檔名是 `yolo11s.engine`）。
 - 遠處的人分數通常比較低，可以再加 `--conf 0.25`。
 
+## 第一人稱影片：不框自己的手
+
+預設會自動忽略「碰到畫面最底部、而且從畫面下半部才開始」的框，也就是拍攝者自己露出來的手和手臂。站在前面的人通常從畫面中上方開始，不會被誤刪。
+
+- 手還是被框到：把 `--self-top` 調小，例如 `--self-top 0.35`
+- 前面的人被誤刪：把 `--self-top` 調大，例如 `--self-top 0.65`
+- 不是第一人稱、不想過濾：加 `--keep-self`
+
 ## 跑不到 60 FPS？
 
 1. 確認啟動時印出的是 `CUDA - 你的顯卡`，不是 CPU。
