@@ -96,9 +96,21 @@ def main():
         print("[警告] 沒有使用 GPU，60 FPS 基本上跑不到。請安裝 CUDA 版 PyTorch。")
 
     model = YOLO(args.model)
+
+    # 預測參數只算一次，迴圈裡重複使用
+    pred_kwargs = dict(classes=[PERSON_CLASS_ID], conf=args.conf, imgsz=args.imgsz,
+                       device=device, verbose=False)
+    if half and not args.model.endswith(".engine"):
+        # .engine 轉換時已經是 FP16，不用再指定。
+        # 新版 ultralytics 把 half 改名成 quantize，舊版沒有 quantize，兩種都相容
+        from ultralytics.cfg import DEFAULT_CFG_DICT
+        if "quantize" in DEFAULT_CFG_DICT:
+            pred_kwargs["quantize"] = 16
+        else:
+            pred_kwargs["half"] = True
     # 暖機：第一次推論比較慢，先跑一次空白圖
     model.predict(np.zeros((args.imgsz, args.imgsz, 3), dtype=np.uint8),
-                  imgsz=args.imgsz, device=device, half=half, verbose=False)
+                  **pred_kwargs)
 
     # ---- 螢幕擷取 ----
     camera = dxcam.create(output_idx=args.monitor, output_color="BGR")
@@ -128,9 +140,7 @@ def main():
                 continue
             t1 = time.perf_counter()
 
-            result = model.predict(frame, classes=[PERSON_CLASS_ID], conf=args.conf,
-                                   imgsz=args.imgsz, device=device, half=half,
-                                   verbose=False)[0]
+            result = model.predict(frame, **pred_kwargs)[0]
             boxes = result.boxes.xyxy.cpu().numpy().astype(int)
             confs = result.boxes.conf.cpu().numpy()
             t2 = time.perf_counter()
