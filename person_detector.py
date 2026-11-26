@@ -388,6 +388,7 @@ class Detector:
                 self.backend = self.model.predictor.model
                 self.in_dtype = torch.float16 if getattr(self.backend, "fp16", False) else torch.float32
                 self.pre = GpuPreprocessor((h, w), device)
+                self.copy_stream = torch.cuda.Stream()
                 self.fast = True
                 for _ in range(3):
                     self._predict_fast(dummy)
@@ -401,10 +402,25 @@ class Detector:
         self.speed = res.speed
         return res.boxes.xyxy.cpu().numpy().astype(int), res.boxes.conf.cpu().numpy()
 
-    def _predict_fast(self, frame):
+    def prepare(self, frame):
+        """快速流程的第一段：縮小畫面、搬上 GPU。可以在另一個執行緒裡跑（跟推論重疊）。
+
+        用獨立的 CUDA stream 上傳，不用排在推論後面；回傳前確定上傳完成，
+        pinned 緩衝區才能安全地給下一幀重複使用。
+        """
         t0 = time.perf_counter()
-        x, r = self.pre(frame)
-        x = x.to(self.in_dtype)
+        with torch.cuda.stream(self.copy_stream):
+            x, r = self.pre(frame)
+            x = x.to(self.in_dtype)
+            done = torch.cuda.Event()
+            done.record(self.copy_stream)
+        done.synchronize()
+        return x, r, frame.shape[:2], (time.perf_counter() - t0) * 1000
+
+    def detect_prepared(self, prepared):
+        """快速流程的第二段：推論 + 精簡後處理，回傳原始畫面座標的框。"""
+        x, r, (fh, fw), pre_ms = prepared
+        x.record_stream(torch.cuda.current_stream())  # 這塊記憶體是在另一個 stream 配置的
         t1 = time.perf_counter()
 
         out = self.backend(x)
@@ -432,27 +448,38 @@ class Detector:
             boxes = np.stack([cx - bw / 2, cy - bh / 2, cx + bw / 2, cy + bh / 2], axis=1)
             idx = nms_numpy(boxes, sc, self.iou)[: self.max_det]
             boxes = boxes[idx] / r         # 換回原始畫面的座標
-            fh, fw = frame.shape[:2]
             np.clip(boxes[:, 0::2], 0, fw - 1, out=boxes[:, 0::2])
             np.clip(boxes[:, 1::2], 0, fh - 1, out=boxes[:, 1::2])
             xyxy = boxes.round().astype(np.int32)
             conf = sc[idx]
         t3 = time.perf_counter()
         # 推論包含把結果搬回 CPU（要等顯卡算完）
-        self.speed = {"preprocess": (t1 - t0) * 1000, "inference": (t2 - t1) * 1000,
+        self.speed = {"preprocess": pre_ms, "inference": (t2 - t1) * 1000,
                       "postprocess": (t3 - t2) * 1000}
         return xyxy, conf
+
+    def _predict_fast(self, frame):
+        return self.detect_prepared(self.prepare(frame))
+
+    def finish(self, xyxy, confs, h, w):
+        """忽略區域、第一人稱的手、追蹤、數量限制。"""
+        xyxy, confs = filter_ignore(xyxy, confs, h, w, self.ignore)
+        if not self.keep_self:
+            xyxy, confs = filter_self(xyxy, confs, h, w, self.self_top)
+        if self.tracker is not None:
+            xyxy, confs = self.tracker.update(xyxy, confs, h, w)
+        return limit_boxes(xyxy, confs, h, self.min_height, self.max_boxes)
+
+    def process_prepared(self, prepared):
+        """給管線用：已經 prepare 好的畫面 → 最終要畫的框。"""
+        fh, fw = prepared[2]
+        xyxy, confs = self.detect_prepared(prepared)
+        return self.finish(xyxy, confs, fh, fw)
 
     def __call__(self, frame):
         """回傳 (框 xyxy 整數陣列, 信心分數陣列)。self.speed 記錄前處理 / 推論 / 後處理毫秒數。"""
         xyxy, confs = self._predict_fast(frame) if self.fast else self._predict_ultralytics(frame)
-        xyxy, confs = filter_ignore(xyxy, confs, frame.shape[0], frame.shape[1], self.ignore)
-        if not self.keep_self:
-            xyxy, confs = filter_self(xyxy, confs, frame.shape[0], frame.shape[1], self.self_top)
-        if self.tracker is not None:
-            xyxy, confs = self.tracker.update(xyxy, confs, frame.shape[0], frame.shape[1])
-        xyxy, confs = limit_boxes(xyxy, confs, frame.shape[0], self.min_height, self.max_boxes)
-        return xyxy, confs
+        return self.finish(xyxy, confs, frame.shape[0], frame.shape[1])
 
 
 def main():

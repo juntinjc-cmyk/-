@@ -23,6 +23,7 @@ import ctypes
 import multiprocessing as mp
 import signal
 import sys
+import threading
 import time
 from ctypes import wintypes
 
@@ -66,6 +67,46 @@ def apply_color_key(hwnd):
     return bool(ok) and bool(flags.value & LWA_COLORKEY) and key.value == 0
 
 
+class Prefetcher(threading.Thread):
+    """管線：在背景執行緒裡先把「下一幀」擷取好、縮小好、搬上 GPU，
+    主執行緒的 GPU 推論同時在算「這一幀」，兩邊重疊，整體更快，準確度不變。"""
+
+    def __init__(self, camera, detector):
+        super().__init__(daemon=True)
+        self.camera = camera
+        self.detector = detector
+        self.running = True
+        self.error = None
+        self._slot = None
+        self._cond = threading.Condition()
+
+    def run(self):
+        import torch
+        torch.cuda.set_device(self.detector.pre.device)
+        try:
+            while self.running:
+                frame = self.camera.get_latest_frame()
+                if frame is None:
+                    continue
+                item = self.detector.prepare(frame)
+                with self._cond:
+                    self._slot = item      # 只留最新的一幀，舊的直接丟掉
+                    self._cond.notify()
+        except Exception as e:
+            self.error = e
+            with self._cond:
+                self._cond.notify()
+
+    def get(self, timeout=1.0):
+        with self._cond:
+            if self._slot is None and self.error is None:
+                self._cond.wait(timeout)
+            if self.error is not None:
+                raise self.error
+            item, self._slot = self._slot, None
+            return item
+
+
 def run_detection(args, conn):
     """主程式：擷取螢幕 → 偵測 → 把框（螢幕實體像素座標）送給疊加視窗子程式。"""
     import dxcam
@@ -79,6 +120,12 @@ def run_detection(args, conn):
     left, top = region[0], region[1]
     print(f"[資訊] 螢幕 {camera.width}x{camera.height}，擷取區域 {region}，目標 {args.fps} FPS")
     camera.start(region=region, target_fps=args.fps, video_mode=True)
+
+    prefetcher = None
+    if detector.fast and not args.no_pipeline:
+        prefetcher = Prefetcher(camera, detector)
+        prefetcher.start()
+    print(f"[資訊] 管線（擷取和推論同時進行）: {'開' if prefetcher else '關'}")
     print("[資訊] 開始偵測。要結束請在這個視窗按 Ctrl + C")
 
     fps_ema = 0.0
@@ -89,11 +136,18 @@ def run_detection(args, conn):
     try:
         while True:
             t0 = time.perf_counter()
-            frame = camera.get_latest_frame()
-            if frame is None:
-                continue
-            t1 = time.perf_counter()
-            xyxy, confs = detector(frame)
+            if prefetcher is not None:
+                item = prefetcher.get()
+                if item is None:
+                    continue
+                t1 = time.perf_counter()
+                xyxy, confs = detector.process_prepared(item)
+            else:
+                frame = camera.get_latest_frame()
+                if frame is None:
+                    continue
+                t1 = time.perf_counter()
+                xyxy, confs = detector(frame)
             boxes = [(int(x1) + left, int(y1) + top, int(x2) + left, int(y2) + top, float(c))
                      for (x1, y1, x2, y2), c in zip(xyxy, confs)]
             now = time.perf_counter()
@@ -122,6 +176,9 @@ def run_detection(args, conn):
     except KeyboardInterrupt:
         pass
     finally:
+        if prefetcher is not None:
+            prefetcher.running = False
+            prefetcher.join(timeout=2)
         camera.stop()
         del camera
 
@@ -273,6 +330,8 @@ def main():
     from person_detector import build_parser
 
     parser = build_parser()
+    parser.add_argument("--no-pipeline", action="store_true",
+                        help="關閉管線（擷取和推論輪流做；管線有問題時才用）")
     parser.add_argument("--recordable", action="store_true",
                         help="讓錄影軟體也錄得到框（框也會被偵測程式看到）")
     args = parser.parse_args()
