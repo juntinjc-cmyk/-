@@ -344,16 +344,44 @@ def no_polys(n):
     return np.full(n, None, dtype=object)
 
 
-def mask_to_poly(mask, scale, r, fh, fw):
-    """一張人形遮罩（0/1）→ 最大那塊的外框輪廓點（原始畫面座標）。抓不到就回傳 None。"""
+OUTLINE_UPSCALE = 2   # 遮罩放大倍數：越大輪廓越細緻，但越慢
+
+
+def mask_to_poly(logits, box_p, s4, r, fh, fw):
+    """一個人的遮罩分數圖 → 外框輪廓點（原始畫面座標）。抓不到就回傳 None。
+
+    logits: 這個人的原型遮罩分數 (mh, mw)，> 0 代表是人
+    box_p:  這個人的框（原型遮罩座標）
+    s4:     原型遮罩 1 格 = 模型輸入幾個像素（通常是 4）
+    只處理框附近的一小塊，人很多時也不會變慢太多。
+    """
+    mh, mw = logits.shape
+    x1, y1, x2, y2 = box_p
+    ix1, iy1 = max(int(np.floor(x1)) - 1, 0), max(int(np.floor(y1)) - 1, 0)
+    ix2, iy2 = min(int(np.ceil(x2)) + 1, mw), min(int(np.ceil(y2)) + 1, mh)
+    if ix2 - ix1 < 2 or iy2 - iy1 < 2:
+        return None
+    u = OUTLINE_UPSCALE
+    crop = logits[iy1:iy2, ix1:ix2].astype(np.float32)
+    up = cv2.resize(crop, None, fx=u, fy=u, interpolation=cv2.INTER_LINEAR)
+    mask = (up > 0).astype(np.uint8)            # 分數 > 0 等於機率 > 0.5
+    # 只保留框裡面的部分（跟 ultralytics 一樣），避免黏到旁邊的人
+    bx1, by1 = int(round((x1 - ix1) * u)), int(round((y1 - iy1) * u))
+    bx2, by2 = int(round((x2 - ix1) * u)), int(round((y2 - iy1) * u))
+    mask[:max(by1, 0), :] = 0
+    mask[max(by2, 0):, :] = 0
+    mask[:, :max(bx1, 0)] = 0
+    mask[:, max(bx2, 0):] = 0
     contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
     if not contours:
         return None
     c = max(contours, key=cv2.contourArea)
-    c = cv2.approxPolyDP(c, 0.8, True)        # 稍微簡化，點少一點畫起來比較快、比較不抖
+    c = cv2.approxPolyDP(c, 0.8, True)          # 稍微簡化，點少一點畫起來比較快、比較不抖
     if len(c) < 3:
         return None
-    pts = c[:, 0, :].astype(np.float32) * scale / r   # 遮罩座標 → 模型輸入座標 → 原始畫面座標
+    pts = c[:, 0, :].astype(np.float32)
+    pts = (pts + 0.5) / u - 0.5 + (ix1, iy1)    # 放大後的座標 → 原型遮罩座標
+    pts = (pts + 0.5) * s4 / r                  # → 模型輸入座標 → 原始畫面座標
     pts[:, 0] = np.clip(pts[:, 0], 0, fw - 1)
     pts[:, 1] = np.clip(pts[:, 1], 0, fh - 1)
     return pts
@@ -514,26 +542,17 @@ class Detector:
         return xyxy, conf, polys
 
     def _outlines(self, out, protos, gidx, boxes_in, coef_row, r, fh, fw):
-        """用遮罩係數 × 原型遮罩算出每個人的人形，再轉成輪廓線。主要計算都在 GPU 上。"""
-        import torch.nn.functional as F
+        """用遮罩係數 × 原型遮罩算出每個人的人形分數圖（GPU），再在 CPU 上逐人轉成輪廓線。"""
         th = self.pre.th
         g = torch.as_tensor(gidx, device=out.device, dtype=torch.long)
         coef = out[coef_row:, g].float().T                      # (k, 32)
         p = protos[0].float()                                   # (32, mh, mw)
         nm, mh, mw = p.shape
-        m = (coef @ p.reshape(nm, -1)).reshape(-1, mh, mw)      # (k, mh, mw)，還沒過 sigmoid
-        m = F.interpolate(m[None], scale_factor=2, mode="bilinear", align_corners=False)[0]
-        scale = th / m.shape[1]                                 # 遮罩 1 格 = 模型輸入幾個像素
-        # 只保留各自框裡面的部分（跟 ultralytics 一樣），避免黏到旁邊的人
-        b = torch.as_tensor(boxes_in / scale, device=m.device, dtype=torch.float32)
-        ys = torch.arange(m.shape[1], device=m.device, dtype=torch.float32)[None, :, None]
-        xs = torch.arange(m.shape[2], device=m.device, dtype=torch.float32)[None, None, :]
-        inside = ((xs >= b[:, 0, None, None]) & (xs < b[:, 2, None, None]) &
-                  (ys >= b[:, 1, None, None]) & (ys < b[:, 3, None, None]))
-        masks = ((m > 0) & inside).to(torch.uint8).cpu().numpy()  # logit > 0 等於機率 > 0.5
+        logits = (coef @ p.reshape(nm, -1)).reshape(-1, mh, mw).half().cpu().numpy()
+        s4 = th / mh                                            # 原型遮罩 1 格 = 輸入幾個像素
         polys = no_polys(len(gidx))
         for i in range(len(gidx)):
-            polys[i] = mask_to_poly(masks[i], scale, r, fh, fw)
+            polys[i] = mask_to_poly(logits[i], boxes_in[i] / s4, s4, r, fh, fw)
         return polys
 
     def _predict_fast(self, frame):
