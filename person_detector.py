@@ -33,8 +33,10 @@ def build_parser():
                    help="擷取螢幕中央 size x size 的區域；0（預設）代表整個螢幕")
     p.add_argument("--region", type=int, nargs=4, metavar=("LEFT", "TOP", "RIGHT", "BOTTOM"),
                    help="自訂擷取區域（會覆蓋 --size）")
-    p.add_argument("--imgsz", type=int, default=640,
-                   help="模型輸入尺寸。越小越快；全螢幕時遠處小人物抓不到可調大到 960 或 1280")
+    p.add_argument("--imgsz", type=int, nargs="+", default=[640],
+                   help="模型輸入尺寸：一個數字（正方形，例如 640）或「高 寬」兩個數字"
+                        "（例如 736 1280，適合 16:9 螢幕）。越大越能抓到遠處小人物，但越慢。"
+                        "用 .engine 時必須跟轉換時的 imgsz 一樣")
     p.add_argument("--conf", type=float, default=0.4, help="信心門檻，低於此值的框不顯示")
     p.add_argument("--monitor", type=int, default=0, help="要擷取的螢幕編號")
     p.add_argument("--device", default=None, help="例如 0（第一張 GPU）或 cpu；預設自動選擇")
@@ -99,7 +101,11 @@ def load_model(args):
     model = YOLO(args.model)
 
     # 預測參數只算一次，迴圈裡重複使用
-    pred_kwargs = dict(classes=[PERSON_CLASS_ID], conf=args.conf, imgsz=args.imgsz,
+    if len(args.imgsz) == 1:
+        imgsz, (h, w) = args.imgsz[0], (args.imgsz[0], args.imgsz[0])
+    else:
+        imgsz, (h, w) = list(args.imgsz[:2]), args.imgsz[:2]
+    pred_kwargs = dict(classes=[PERSON_CLASS_ID], conf=args.conf, imgsz=imgsz,
                        device=device, verbose=False)
     if half and not args.model.endswith(".engine"):
         # .engine 轉換時已經是 FP16，不用再指定。
@@ -110,7 +116,7 @@ def load_model(args):
         else:
             pred_kwargs["half"] = True
     # 暖機：第一次推論比較慢，先跑一次空白圖
-    model.predict(np.zeros((args.imgsz, args.imgsz, 3), dtype=np.uint8),
+    model.predict(np.zeros((h, w, 3), dtype=np.uint8),
                   **pred_kwargs)
     return model, pred_kwargs
 

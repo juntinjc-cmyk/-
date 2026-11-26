@@ -56,6 +56,19 @@ python person_overlay.py --model yolo11n.engine --recordable
 
 注意：Netflix 等有 DRM 保護的影片，在某些瀏覽器擷取到的會是黑畫面，這時偵測不到人；YouTube 一般沒有這個問題。
 
+## 抓更遠、更小的人
+
+4K 畫面預設被縮到 640 寬才偵測（縮小 6 倍），遠處的人只剩幾個像素就抓不到了。把輸入加大即可，建議用跟螢幕一樣 16:9 的長方形尺寸，不會浪費運算在補黑邊上：
+
+```bash
+yolo export model=yolo11n.pt format=engine half=True imgsz=736,1280
+python person_overlay.py --model yolo11n.engine --imgsz 736 1280 --recordable
+```
+
+- `.engine` 的尺寸在轉換時就固定，`--imgsz` 必須跟轉換時一樣。
+- 還想更準：把 `yolo11n.pt` 換成 `yolo11s.pt`（轉出來檔名是 `yolo11s.engine`）。
+- 遠處的人分數通常比較低，可以再加 `--conf 0.25`。
+
 ## 跑不到 60 FPS？
 
 1. 確認啟動時印出的是 `CUDA - 你的顯卡`，不是 CPU。
