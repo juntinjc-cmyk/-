@@ -37,6 +37,7 @@ BOX_COLOR = QColor(0, 255, 0)
 KEY_COLOR = QColor(0, 0, 0)          # 純黑 = 透明，畫面上其他地方都不能用純黑
 HUD_BG_COLOR = QColor(24, 24, 24)
 HUD_INTERVAL = 0.25                  # 左上角 FPS 每 0.25 秒更新一次就夠了
+FULL_REFRESH_INTERVAL = 0.5          # 每 0.5 秒整個畫面重畫一次，清掉殘影
 
 GWL_EXSTYLE = -20
 WS_EX_LAYERED = 0x00080000
@@ -143,11 +144,12 @@ class Overlay(QWidget):
         self.fps = -1.0
         self.hud_fps = -1.0
         self._hud_time = 0.0
+        self._full_time = 0.0
         self._dirty = QRegion()
 
     HUD_RECT = (20, 20, 20 + 700, 20 + 70)  # 左上角 FPS 區塊（實體像素）
 
-    def _to_logical(self, x1, y1, x2, y2, pad=6):
+    def _to_logical(self, x1, y1, x2, y2, pad=12):
         dpr = self.devicePixelRatioF()
         return QRect(int((x1 - pad) / dpr), int((y1 - pad) / dpr),
                      int((x2 - x1 + 2 * pad) / dpr) + 2, int((y2 - y1 + 2 * pad) / dpr) + 2)
@@ -173,7 +175,12 @@ class Overlay(QWidget):
             self.hud_fps = fps
             self._hud_time = now
             dirty += self._to_logical(*self.HUD_RECT)
-        self.update(dirty)
+        if now - self._full_time >= FULL_REFRESH_INTERVAL:
+            # 保險：定期整個畫面清一次，萬一有沒清乾淨的殘影也會在 0.5 秒內消失
+            self._full_time = now
+            self.update()
+        else:
+            self.update(dirty)
         self._dirty = new_dirty
 
     def paintEvent(self, event):
