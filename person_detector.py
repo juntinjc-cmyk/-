@@ -102,23 +102,26 @@ def exclude_window_from_capture(title):
     return exclude_hwnd_from_capture(hwnd)
 
 
-def draw_boxes(frame, boxes, confs):
-    for x1, y1, x2, y2 in boxes:  # 只畫框，不畫文字
-        cv2.rectangle(frame, (int(x1), int(y1)), (int(x2), int(y2)), (0, 255, 0), 2)
+def draw_boxes(frame, boxes, confs, polys=None):
+    for i, (x1, y1, x2, y2) in enumerate(boxes):  # 只畫框（或輪廓），不畫文字
+        if polys is not None and polys[i] is not None:
+            cv2.polylines(frame, [polys[i].astype(np.int32)], True, (0, 255, 0), 2)
+        else:
+            cv2.rectangle(frame, (int(x1), int(y1)), (int(x2), int(y2)), (0, 255, 0), 2)
 
 
-def filter_self(xyxy, confs, h, w, self_top):
+def filter_self(xyxy, confs, polys, h, w, self_top):
     """第一人稱畫面：去掉拍攝者自己露出來的手、手臂。
 
     判斷方式：框碰到畫面最底部，而且框的頂端在畫面下方（低於 self_top 的高度比例）。
     真正站在前面的人，框通常會從畫面中上方開始，不會被誤刪。
     """
     if len(xyxy) == 0:
-        return xyxy, confs
+        return xyxy, confs, polys
     touches_bottom = xyxy[:, 3] >= h * 0.97
     starts_low = xyxy[:, 1] >= h * self_top
     keep = ~(touches_bottom & starts_low)
-    return xyxy[keep], confs[keep]
+    return xyxy[keep], confs[keep], polys[keep]
 
 
 def iou_matrix(a, b):
@@ -158,8 +161,9 @@ class BoxTracker:
         self.conf = np.zeros((0,), dtype=np.float32)
         self.misses = np.zeros((0,), dtype=np.int32)
         self.hits = np.zeros((0,), dtype=np.int32)
+        self.polys = np.empty((0,), dtype=object)   # 輪廓模式：每個追蹤對象最新的人形輪廓
 
-    def update(self, det, det_conf, h, w):
+    def update(self, det, det_conf, det_polys, h, w):
         det = det.astype(np.float32)
         pred = self.boxes + self.vel  # 依照速度預測這一幀的位置（快速運動時比較對得上）
 
@@ -193,6 +197,7 @@ class BoxTracker:
             new = a * det[d] + (1 - a) * pred[t]
             self.vel[t] = 0.7 * self.vel[t] + 0.3 * (new - self.boxes[t])
             self.boxes[t] = new
+            self.polys[t] = det_polys[d]   # 輪廓直接用這一幀偵測到的（貼合真實人形）
             self.conf[t] = det_conf[d]
             self.misses[t] = 0
             self.hits[t] += 1
@@ -200,6 +205,10 @@ class BoxTracker:
         # 沒配到的追蹤對象：沿原方向短暫移動，速度很快歸零（停住，不會飄走）
         lost = np.ones(len(self.boxes), dtype=bool)
         lost[matched_t] = False
+        for t in np.nonzero(lost)[0]:      # 抓不到時，輪廓跟著框一起平移
+            if self.polys[t] is not None:
+                shift = (pred[t, :2] + pred[t, 2:]) / 2 - (self.boxes[t, :2] + self.boxes[t, 2:]) / 2
+                self.polys[t] = self.polys[t] + shift
         self.boxes[lost] = pred[lost]
         self.vel[lost] *= 0.5
         self.misses[lost] += 1
@@ -216,6 +225,7 @@ class BoxTracker:
             self.conf = np.concatenate([self.conf, det_conf[cand].astype(np.float32)])
             self.misses = np.concatenate([self.misses, np.zeros(n, np.int32)])
             self.hits = np.concatenate([self.hits, np.ones(n, np.int32)])
+            self.polys = np.concatenate([self.polys, det_polys[cand]])
 
         # 太久沒抓到、或已經跑出畫面的就刪掉
         b = self.boxes
@@ -240,40 +250,41 @@ class BoxTracker:
         out = self.boxes[show].copy()
         out[:, 0::2] = np.clip(out[:, 0::2], 0, w - 1)
         out[:, 1::2] = np.clip(out[:, 1::2], 0, h - 1)
-        return out.round().astype(np.int32), self.conf[show].copy()
+        return out.round().astype(np.int32), self.conf[show].copy(), self.polys[show].copy()
 
     def _keep(self, mask):
         self.boxes, self.vel = self.boxes[mask], self.vel[mask]
         self.conf, self.misses, self.hits = self.conf[mask], self.misses[mask], self.hits[mask]
+        self.polys = self.polys[mask]
 
 
-def limit_boxes(xyxy, confs, h, min_height, max_boxes):
+def limit_boxes(xyxy, confs, polys, h, min_height, max_boxes):
     """過濾太小（太遠）的框，以及只保留最大的幾個框，讓畫面不要太雜。"""
     if len(xyxy) == 0:
-        return xyxy, confs
+        return xyxy, confs, polys
     if min_height > 0:
         keep = (xyxy[:, 3] - xyxy[:, 1]) >= h * min_height
-        xyxy, confs = xyxy[keep], confs[keep]
+        xyxy, confs, polys = xyxy[keep], confs[keep], polys[keep]
     if max_boxes > 0 and len(xyxy) > max_boxes:
         area = (xyxy[:, 2] - xyxy[:, 0]) * (xyxy[:, 3] - xyxy[:, 1])
         idx = np.argsort(-area)[:max_boxes]
-        xyxy, confs = xyxy[idx], confs[idx]
-    return xyxy, confs
+        xyxy, confs, polys = xyxy[idx], confs[idx], polys[idx]
+    return xyxy, confs, polys
 
 
 DEFAULT_IGNORE = [(0.0, 0.65, 0.11, 1.0)]  # 左下角（使用者指定的範圍）
 
 
-def filter_ignore(xyxy, confs, h, w, regions):
+def filter_ignore(xyxy, confs, polys, h, w, regions):
     """框的中心落在任何一個忽略區域（畫面比例）裡，就拿掉。"""
     if len(xyxy) == 0 or not regions:
-        return xyxy, confs
+        return xyxy, confs, polys
     cx = (xyxy[:, 0] + xyxy[:, 2]) / 2 / w
     cy = (xyxy[:, 1] + xyxy[:, 3]) / 2 / h
     drop = np.zeros(len(xyxy), dtype=bool)
     for x1, y1, x2, y2 in regions:
         drop |= (cx >= x1) & (cx <= x2) & (cy >= y1) & (cy <= y2)
-    return xyxy[~drop], confs[~drop]
+    return xyxy[~drop], confs[~drop], polys[~drop]
 
 
 class GpuPreprocessor:
@@ -328,8 +339,32 @@ def nms_numpy(boxes, scores, iou_thr):
     return np.array(keep, dtype=np.int64)
 
 
+def no_polys(n):
+    """方框模式：每個框都沒有輪廓。"""
+    return np.full(n, None, dtype=object)
+
+
+def mask_to_poly(mask, scale, r, fh, fw):
+    """一張人形遮罩（0/1）→ 最大那塊的外框輪廓點（原始畫面座標）。抓不到就回傳 None。"""
+    contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    if not contours:
+        return None
+    c = max(contours, key=cv2.contourArea)
+    c = cv2.approxPolyDP(c, 0.8, True)        # 稍微簡化，點少一點畫起來比較快、比較不抖
+    if len(c) < 3:
+        return None
+    pts = c[:, 0, :].astype(np.float32) * scale / r   # 遮罩座標 → 模型輸入座標 → 原始畫面座標
+    pts[:, 0] = np.clip(pts[:, 0], 0, fw - 1)
+    pts[:, 1] = np.clip(pts[:, 1], 0, fh - 1)
+    return pts
+
+
 class Detector:
-    """載入模型並暖機；呼叫 detector(frame) 回傳 (框 xyxy 整數陣列, 信心分數陣列)，座標對應原始畫面。"""
+    """載入模型並暖機；呼叫 detector(frame) 回傳 (框, 信心分數, 輪廓)，座標對應原始畫面。
+
+    用一般模型（例如 yolo11s.engine）就畫方框；用切割模型（例如 yolo11s-seg.engine）
+    就自動改成沿著人的輪廓描邊。
+    """
 
     def __init__(self, args):
         use_cuda = torch.cuda.is_available()
@@ -341,6 +376,8 @@ class Detector:
             print("[警告] 沒有使用 GPU，60 FPS 基本上跑不到。請安裝 CUDA 版 PyTorch。")
 
         self.model = YOLO(args.model)
+        self.seg = getattr(self.model, "task", "detect") == "segment"
+        print(f"[資訊] 畫法: {'沿著人的輪廓描邊（切割模型）' if self.seg else '方框'}")
 
         if len(args.imgsz) == 1:
             imgsz, (h, w) = args.imgsz[0], (args.imgsz[0], args.imgsz[0])
@@ -400,7 +437,13 @@ class Detector:
     def _predict_ultralytics(self, frame):
         res = self.model.predict(frame, **self.kwargs)[0]
         self.speed = res.speed
-        return res.boxes.xyxy.cpu().numpy().astype(int), res.boxes.conf.cpu().numpy()
+        xyxy = res.boxes.xyxy.cpu().numpy().astype(int)
+        polys = no_polys(len(xyxy))
+        if self.seg and res.masks is not None:
+            for i, pts in enumerate(res.masks.xy):
+                if len(pts) >= 3:
+                    polys[i] = pts.astype(np.float32)
+        return xyxy, res.boxes.conf.cpu().numpy(), polys
 
     def prepare(self, frame):
         """快速流程的第一段：縮小畫面、搬上 GPU。可以在另一個執行緒裡跑（跟推論重疊）。
@@ -424,12 +467,18 @@ class Detector:
         t1 = time.perf_counter()
 
         out = self.backend(x)
+        protos = None
         if isinstance(out, (list, tuple)):
-            out = out[0]
-        out = out[0]                       # (4 + 類別數, 候選框數)
+            # 切割模型有兩個輸出：候選框 (1, C, N) 和人形原型遮罩 (1, 32, H/4, W/4)
+            outs = [o for o in out if hasattr(o, "ndim")]
+            protos = next((o for o in outs if o.ndim == 4), None)
+            out = next(o for o in outs if o.ndim == 3)
+        out = out[0]                       # (4 + 類別數 [+ 32 遮罩係數], 候選框數)
         nc = len(self.model.names)
-        if out.shape[0] != 4 + nc:
-            if out.shape[-1] == 4 + nc:
+        nm = protos.shape[1] if protos is not None else 0
+        rows = 4 + nc + nm
+        if out.shape[0] != rows:
+            if out.shape[-1] == rows:
                 out = out.T
             else:
                 raise RuntimeError(f"不支援的模型輸出形狀 {tuple(out.shape)}")
@@ -442,44 +491,73 @@ class Detector:
         keep = scores > self.conf
         if not keep.any():
             xyxy, conf = np.zeros((0, 4), dtype=np.int32), np.zeros((0,), dtype=np.float32)
+            polys = no_polys(0)
         else:
             cx, cy, bw, bh = sub[0, keep], sub[1, keep], sub[2, keep], sub[3, keep]
             sc = scores[keep]
             boxes = np.stack([cx - bw / 2, cy - bh / 2, cx + bw / 2, cy + bh / 2], axis=1)
             idx = nms_numpy(boxes, sc, self.iou)[: self.max_det]
-            boxes = boxes[idx] / r         # 換回原始畫面的座標
+            boxes_in = boxes[idx]          # 模型輸入座標（算輪廓要用）
+            boxes = boxes_in / r           # 換回原始畫面的座標
             np.clip(boxes[:, 0::2], 0, fw - 1, out=boxes[:, 0::2])
             np.clip(boxes[:, 1::2], 0, fh - 1, out=boxes[:, 1::2])
             xyxy = boxes.round().astype(np.int32)
             conf = sc[idx]
+            polys = no_polys(len(xyxy))
+            if protos is not None and self.seg:
+                gidx = np.nonzero(keep)[0][idx]
+                polys = self._outlines(out, protos, gidx, boxes_in, 4 + nc, r, fh, fw)
         t3 = time.perf_counter()
         # 推論包含把結果搬回 CPU（要等顯卡算完）
         self.speed = {"preprocess": pre_ms, "inference": (t2 - t1) * 1000,
                       "postprocess": (t3 - t2) * 1000}
-        return xyxy, conf
+        return xyxy, conf, polys
+
+    def _outlines(self, out, protos, gidx, boxes_in, coef_row, r, fh, fw):
+        """用遮罩係數 × 原型遮罩算出每個人的人形，再轉成輪廓線。主要計算都在 GPU 上。"""
+        import torch.nn.functional as F
+        th = self.pre.th
+        g = torch.as_tensor(gidx, device=out.device, dtype=torch.long)
+        coef = out[coef_row:, g].float().T                      # (k, 32)
+        p = protos[0].float()                                   # (32, mh, mw)
+        nm, mh, mw = p.shape
+        m = (coef @ p.reshape(nm, -1)).reshape(-1, mh, mw)      # (k, mh, mw)，還沒過 sigmoid
+        m = F.interpolate(m[None], scale_factor=2, mode="bilinear", align_corners=False)[0]
+        scale = th / m.shape[1]                                 # 遮罩 1 格 = 模型輸入幾個像素
+        # 只保留各自框裡面的部分（跟 ultralytics 一樣），避免黏到旁邊的人
+        b = torch.as_tensor(boxes_in / scale, device=m.device, dtype=torch.float32)
+        ys = torch.arange(m.shape[1], device=m.device, dtype=torch.float32)[None, :, None]
+        xs = torch.arange(m.shape[2], device=m.device, dtype=torch.float32)[None, None, :]
+        inside = ((xs >= b[:, 0, None, None]) & (xs < b[:, 2, None, None]) &
+                  (ys >= b[:, 1, None, None]) & (ys < b[:, 3, None, None]))
+        masks = ((m > 0) & inside).to(torch.uint8).cpu().numpy()  # logit > 0 等於機率 > 0.5
+        polys = no_polys(len(gidx))
+        for i in range(len(gidx)):
+            polys[i] = mask_to_poly(masks[i], scale, r, fh, fw)
+        return polys
 
     def _predict_fast(self, frame):
         return self.detect_prepared(self.prepare(frame))
 
-    def finish(self, xyxy, confs, h, w):
+    def finish(self, xyxy, confs, polys, h, w):
         """忽略區域、第一人稱的手、追蹤、數量限制。"""
-        xyxy, confs = filter_ignore(xyxy, confs, h, w, self.ignore)
+        xyxy, confs, polys = filter_ignore(xyxy, confs, polys, h, w, self.ignore)
         if not self.keep_self:
-            xyxy, confs = filter_self(xyxy, confs, h, w, self.self_top)
+            xyxy, confs, polys = filter_self(xyxy, confs, polys, h, w, self.self_top)
         if self.tracker is not None:
-            xyxy, confs = self.tracker.update(xyxy, confs, h, w)
-        return limit_boxes(xyxy, confs, h, self.min_height, self.max_boxes)
+            xyxy, confs, polys = self.tracker.update(xyxy, confs, polys, h, w)
+        return limit_boxes(xyxy, confs, polys, h, self.min_height, self.max_boxes)
 
     def process_prepared(self, prepared):
-        """給管線用：已經 prepare 好的畫面 → 最終要畫的框。"""
+        """給管線用：已經 prepare 好的畫面 → 最終要畫的 (框, 信心分數, 輪廓)。"""
         fh, fw = prepared[2]
-        xyxy, confs = self.detect_prepared(prepared)
-        return self.finish(xyxy, confs, fh, fw)
+        return self.finish(*self.detect_prepared(prepared), fh, fw)
 
     def __call__(self, frame):
-        """回傳 (框 xyxy 整數陣列, 信心分數陣列)。self.speed 記錄前處理 / 推論 / 後處理毫秒數。"""
-        xyxy, confs = self._predict_fast(frame) if self.fast else self._predict_ultralytics(frame)
-        return self.finish(xyxy, confs, frame.shape[0], frame.shape[1])
+        """回傳 (框, 信心分數, 輪廓)。輪廓在方框模式下都是 None。
+        self.speed 記錄前處理 / 推論 / 後處理毫秒數。"""
+        res = self._predict_fast(frame) if self.fast else self._predict_ultralytics(frame)
+        return self.finish(*res, frame.shape[0], frame.shape[1])
 
 
 def main():
@@ -515,12 +593,12 @@ def main():
                 continue
             t1 = time.perf_counter()
 
-            boxes, confs = detector(frame)
+            boxes, confs, polys = detector(frame)
             t2 = time.perf_counter()
 
             if not args.no_show:
                 view = np.ascontiguousarray(frame)  # 確保 OpenCV 可以直接在上面畫
-                draw_boxes(view, boxes, confs)
+                draw_boxes(view, boxes, confs, polys)
                 cv2.putText(view, f"FPS {fps_ema:5.1f} | persons {len(boxes)}", (10, 30),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 255), 2, cv2.LINE_AA)
                 if args.show_scale != 1.0:

@@ -70,6 +70,17 @@ python person_overlay.py --model yolo11n.engine --imgsz 736 1280 --recordable
 - 還想更準：把 `yolo11n.pt` 換成 `yolo11s.pt`（轉出來檔名是 `yolo11s.engine`）。
 - 遠處的人分數通常比較低，可以再加 `--conf 0.25`。
 
+## 沿著人的輪廓描邊
+
+換成切割模型（檔名有 `-seg`）就會自動改成描輪廓，其他參數都一樣：
+
+```bash
+yolo export model=yolo11s-seg.pt format=engine half=True imgsz=[544,960]
+python person_overlay.py --model yolo11s-seg.engine --imgsz 544 960 --recordable --hold 12 --fps 60
+```
+
+想換回方框，就把 `--model` 換回 `yolo11s.engine`。
+
 ## 第一人稱影片：不框自己的手
 
 預設會自動忽略「碰到畫面最底部、而且從畫面下半部才開始」的框，也就是拍攝者自己露出來的手和手臂。站在前面的人通常從畫面中上方開始，不會被誤刪。

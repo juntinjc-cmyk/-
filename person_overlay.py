@@ -27,8 +27,8 @@ import threading
 import time
 from ctypes import wintypes
 
-from PySide6.QtCore import QRect, Qt, QTimer
-from PySide6.QtGui import QColor, QFont, QGuiApplication, QPainter, QPen, QRegion
+from PySide6.QtCore import QPoint, QRect, Qt, QTimer
+from PySide6.QtGui import QColor, QFont, QGuiApplication, QPainter, QPen, QPolygon, QRegion
 from PySide6.QtWidgets import QApplication, QWidget
 
 # 偵測相關的套件（torch、ultralytics、dxcam）只在主程式載入，
@@ -110,6 +110,7 @@ class Prefetcher(threading.Thread):
 def run_detection(args, conn):
     """主程式：擷取螢幕 → 偵測 → 把框（螢幕實體像素座標）送給疊加視窗子程式。"""
     import dxcam
+    import numpy as np
     from person_detector import Detector, compute_region
 
     detector = Detector(args)
@@ -141,15 +142,20 @@ def run_detection(args, conn):
                 if item is None:
                     continue
                 t1 = time.perf_counter()
-                xyxy, confs = detector.process_prepared(item)
+                xyxy, confs, polys = detector.process_prepared(item)
             else:
                 frame = camera.get_latest_frame()
                 if frame is None:
                     continue
                 t1 = time.perf_counter()
-                xyxy, confs = detector(frame)
-            boxes = [(int(x1) + left, int(y1) + top, int(x2) + left, int(y2) + top, float(c))
-                     for (x1, y1, x2, y2), c in zip(xyxy, confs)]
+                xyxy, confs, polys = detector(frame)
+            # 每個人：(x1, y1, x2, y2, 信心, 輪廓)。輪廓是螢幕座標的整數點陣列；方框模式下是 None
+            boxes = []
+            for (x1, y1, x2, y2), c, poly in zip(xyxy, confs, polys):
+                if poly is not None:
+                    poly = (poly + (left, top)).round().astype(np.int32)
+                boxes.append((int(x1) + left, int(y1) + top, int(x2) + left, int(y2) + top,
+                              float(c), poly))
             now = time.perf_counter()
             t_cap += t1 - t0
             t_inf += now - t1
@@ -212,9 +218,13 @@ class Overlay(QWidget):
                      int((x2 - x1 + 2 * pad) / dpr) + 2, int((y2 - y1 + 2 * pad) / dpr) + 2)
 
     def _region_for(self, boxes):
-        """只算框的四條邊（不是整個框的內部），換成 Qt 的邏輯座標。"""
+        """方框：只算四條邊（不是整個框的內部）；輪廓：算輪廓的外接範圍。換成 Qt 的邏輯座標。"""
         region = QRegion()
-        for x1, y1, x2, y2, _ in boxes:
+        for x1, y1, x2, y2, _, poly in boxes:
+            if poly is not None:
+                region += self._to_logical(int(poly[:, 0].min()), int(poly[:, 1].min()),
+                                           int(poly[:, 0].max()), int(poly[:, 1].max()))
+                continue
             region += self._to_logical(x1, y1, x2, y1)                            # 上邊
             region += self._to_logical(x1, y2, x2, y2)                            # 下邊
             region += self._to_logical(x1, y1, x1, y2)                            # 左邊
@@ -251,8 +261,11 @@ class Overlay(QWidget):
 
         p.setPen(QPen(BOX_COLOR, 3))
         p.setBrush(Qt.NoBrush)
-        for x1, y1, x2, y2, _ in self.boxes:   # 只畫框，不畫文字
-            p.drawRect(x1, y1, x2 - x1, y2 - y1)
+        for x1, y1, x2, y2, _, poly in self.boxes:   # 只畫框或輪廓，不畫文字
+            if poly is not None:
+                p.drawPolygon(QPolygon([QPoint(int(x), int(y)) for x, y in poly]))
+            else:
+                p.drawRect(x1, y1, x2 - x1, y2 - y1)
         font = QFont()
 
         # 左上角顯示 FPS 和人數（fps < 0 代表已停止，不顯示）
