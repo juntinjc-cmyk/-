@@ -24,7 +24,7 @@ from PySide6.QtCore import QRect, Qt, QThread, QTimer, Signal
 from PySide6.QtGui import QColor, QFont, QGuiApplication, QPainter, QPen, QRegion
 from PySide6.QtWidgets import QApplication, QWidget
 
-from person_detector import build_parser, compute_region, exclude_hwnd_from_capture, load_model
+from person_detector import build_parser, Detector, compute_region, exclude_hwnd_from_capture
 
 BOX_COLOR = QColor(0, 255, 0)
 LABEL_TEXT_COLOR = QColor(0, 0, 0)
@@ -46,7 +46,7 @@ class DetectorThread(QThread):
     def run(self):
         args = self.args
         # 模型和擷取都在這個執行緒裡建立，避免跨執行緒使用 CUDA / TensorRT
-        model, pred_kwargs = load_model(args)
+        detector = Detector(args)
         camera = dxcam.create(output_idx=args.monitor, output_color="BGR")
         region = compute_region(args, camera.width, camera.height)
         left, top = region[0], region[1]
@@ -65,9 +65,7 @@ class DetectorThread(QThread):
                 if frame is None:
                     continue
                 t1 = time.perf_counter()
-                result = model.predict(frame, **pred_kwargs)[0]
-                xyxy = result.boxes.xyxy.cpu().numpy().astype(int)
-                confs = result.boxes.conf.cpu().numpy()
+                xyxy, confs = detector(frame)
                 boxes = [(x1 + left, y1 + top, x2 + left, y2 + top, float(c))
                          for (x1, y1, x2, y2), c in zip(xyxy, confs)]
                 now = time.perf_counter()

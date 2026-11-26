@@ -35,6 +35,7 @@ python person_detector.py
 | `--monitor` | 0 | 擷取哪一個螢幕 |
 | `--show-scale` | 0.5 | 預覽視窗縮放 |
 | `--no-show` | – | 不開視窗，只印 FPS |
+| `--cpu-preprocess` | – | 改回 CPU 前處理（預設在 GPU 上做，較快；出問題時才用） |
 
 ## 螢幕疊加模式（框直接畫在螢幕上）
 

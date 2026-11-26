@@ -42,6 +42,8 @@ def build_parser():
     p.add_argument("--device", default=None, help="例如 0（第一張 GPU）或 cpu；預設自動選擇")
     p.add_argument("--show-scale", type=float, default=0.5, help="預覽視窗縮放比例")
     p.add_argument("--no-show", action="store_true", help="不顯示預覽視窗")
+    p.add_argument("--cpu-preprocess", action="store_true",
+                   help="改回 ultralytics 內建的 CPU 前處理（GPU 前處理有問題時用）")
     return p
 
 
@@ -88,42 +90,92 @@ def draw_boxes(frame, boxes, confs):
                     cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 0), 1, cv2.LINE_AA)
 
 
-def load_model(args):
-    """載入模型、暖機，回傳 (model, 預測參數)。"""
-    use_cuda = torch.cuda.is_available()
-    device = args.device if args.device is not None else (0 if use_cuda else "cpu")
-    half = use_cuda and str(device) != "cpu"  # GPU 上用 FP16 加速
-    print(f"[資訊] 裝置: {'CUDA - ' + torch.cuda.get_device_name(0) if half else 'CPU'}")
-    print(f"[資訊] PyTorch {torch.__version__}，CUDA {torch.version.cuda}")
-    if not half:
-        print("[警告] 沒有使用 GPU，60 FPS 基本上跑不到。請安裝 CUDA 版 PyTorch。")
+class GpuPreprocessor:
+    """把螢幕畫面轉成模型輸入，重活交給 GPU。
 
-    model = YOLO(args.model)
+    ultralytics 內建的前處理全在 CPU 上用 numpy 做（4K 畫面縮小、BGR 轉 RGB、
+    轉置、轉浮點數），而且很吃 Python 的 GIL，跟疊加視窗搶 CPU 時會明顯變慢。
+    這裡只在 CPU 上用 OpenCV 縮小一次（多執行緒、很快），其餘都在 GPU 上做。
+    """
 
-    # 預測參數只算一次，迴圈裡重複使用
-    if len(args.imgsz) == 1:
-        imgsz, (h, w) = args.imgsz[0], (args.imgsz[0], args.imgsz[0])
-    else:
-        imgsz, (h, w) = list(args.imgsz[:2]), args.imgsz[:2]
-    pred_kwargs = dict(classes=[PERSON_CLASS_ID], conf=args.conf, imgsz=imgsz,
-                       device=device, verbose=False)
-    if half and not args.model.endswith(".engine"):
-        # .engine 轉換時已經是 FP16，不用再指定。
-        # 新版 ultralytics 把 half 改名成 quantize，舊版沒有 quantize，兩種都相容
-        from ultralytics.cfg import DEFAULT_CFG_DICT
-        if "quantize" in DEFAULT_CFG_DICT:
-            pred_kwargs["quantize"] = 16
+    def __init__(self, target_hw, device):
+        self.th, self.tw = target_hw
+        self.device = torch.device(f"cuda:{device}" if str(device).isdigit() else device)
+        self.pinned = None
+
+    def __call__(self, frame):
+        h, w = frame.shape[:2]
+        r = min(self.th / h, self.tw / w)
+        nw, nh = min(round(w * r), self.tw), min(round(h * r), self.th)
+        small = frame if (nw, nh) == (w, h) else cv2.resize(
+            frame, (nw, nh), interpolation=cv2.INTER_LINEAR)
+
+        # 用 pinned memory 讓 CPU -> GPU 傳輸更快
+        if self.pinned is None or tuple(self.pinned.shape) != small.shape:
+            self.pinned = torch.empty(small.shape, dtype=torch.uint8).pin_memory()
+        self.pinned.numpy()[...] = small
+        g = self.pinned.to(self.device, non_blocking=True)
+
+        x = g.permute(2, 0, 1).flip(0).float().div_(255.0)  # HWC BGR -> CHW RGB, 0~1
+        canvas = torch.full((1, 3, self.th, self.tw), 114 / 255.0,
+                            device=self.device, dtype=torch.float32)  # 灰色補邊，跟 ultralytics 一樣
+        canvas[0, :, :nh, :nw] = x
+        return canvas, r
+
+
+class Detector:
+    """載入模型並暖機；呼叫 detector(frame) 回傳 (框 xyxy 整數陣列, 信心分數陣列)，座標對應原始畫面。"""
+
+    def __init__(self, args):
+        use_cuda = torch.cuda.is_available()
+        device = args.device if args.device is not None else (0 if use_cuda else "cpu")
+        gpu = use_cuda and str(device) != "cpu"
+        print(f"[資訊] 裝置: {'CUDA - ' + torch.cuda.get_device_name(0) if gpu else 'CPU'}")
+        print(f"[資訊] PyTorch {torch.__version__}，CUDA {torch.version.cuda}")
+        if not gpu:
+            print("[警告] 沒有使用 GPU，60 FPS 基本上跑不到。請安裝 CUDA 版 PyTorch。")
+
+        self.model = YOLO(args.model)
+
+        if len(args.imgsz) == 1:
+            imgsz, (h, w) = args.imgsz[0], (args.imgsz[0], args.imgsz[0])
         else:
-            pred_kwargs["half"] = True
-    # 暖機：第一次推論比較慢，先跑一次空白圖
-    model.predict(np.zeros((h, w, 3), dtype=np.uint8),
-                  **pred_kwargs)
-    return model, pred_kwargs
+            imgsz, (h, w) = list(args.imgsz[:2]), tuple(args.imgsz[:2])
+
+        # 預測參數只算一次，迴圈裡重複使用
+        self.kwargs = dict(classes=[PERSON_CLASS_ID], conf=args.conf, imgsz=imgsz,
+                           device=device, verbose=False)
+        if gpu and not args.model.endswith(".engine"):
+            # .engine 轉換時已經是 FP16，不用再指定。
+            # 新版 ultralytics 把 half 改名成 quantize，舊版沒有 quantize，兩種都相容
+            from ultralytics.cfg import DEFAULT_CFG_DICT
+            if "quantize" in DEFAULT_CFG_DICT:
+                self.kwargs["quantize"] = 16
+            else:
+                self.kwargs["half"] = True
+
+        self.pre = GpuPreprocessor((h, w), device) if gpu and not args.cpu_preprocess else None
+        print(f"[資訊] 前處理: {'GPU' if self.pre else 'CPU（ultralytics 內建）'}")
+
+        # 暖機：前幾次推論比較慢，先跑幾次空白圖
+        dummy = np.zeros((h, w, 3), dtype=np.uint8)
+        for _ in range(3):
+            self(dummy)
+
+    def __call__(self, frame):
+        if self.pre is not None:
+            x, r = self.pre(frame)
+            res = self.model.predict(x, **self.kwargs)[0]
+            xyxy = (res.boxes.xyxy / r).round().int().cpu().numpy()
+        else:
+            res = self.model.predict(frame, **self.kwargs)[0]
+            xyxy = res.boxes.xyxy.cpu().numpy().astype(int)
+        return xyxy, res.boxes.conf.cpu().numpy()
 
 
 def main():
     args = build_parser().parse_args()
-    model, pred_kwargs = load_model(args)
+    detector = Detector(args)
 
     # ---- 螢幕擷取 ----
     camera = dxcam.create(output_idx=args.monitor, output_color="BGR")
@@ -153,9 +205,7 @@ def main():
                 continue
             t1 = time.perf_counter()
 
-            result = model.predict(frame, **pred_kwargs)[0]
-            boxes = result.boxes.xyxy.cpu().numpy().astype(int)
-            confs = result.boxes.conf.cpu().numpy()
+            boxes, confs = detector(frame)
             t2 = time.perf_counter()
 
             if not args.no_show:
