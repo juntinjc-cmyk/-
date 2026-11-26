@@ -2,8 +2,8 @@
 即時人物偵測：用 dxcam 擷取螢幕畫面，用 YOLO 偵測人物並畫框。
 
 用法範例：
-    python person_detector.py                      # 擷取螢幕中央 640x640，目標 60 FPS
-    python person_detector.py --size 0             # 擷取整個螢幕（較慢）
+    python person_detector.py                      # 擷取整個螢幕，目標 60 FPS
+    python person_detector.py --size 640           # 只擷取螢幕中央 640x640（較快）
     python person_detector.py --region 0 0 1280 720
     python person_detector.py --no-show            # 不開預覽視窗，只在終端機印 FPS
 
@@ -11,6 +11,7 @@
 """
 
 import argparse
+import ctypes
 import time
 
 import cv2
@@ -28,15 +29,16 @@ def parse_args():
     p.add_argument("--model", default="yolo11n.pt",
                    help="YOLO 模型檔（第一次執行會自動下載）。n 最快，s/m 較準但較慢")
     p.add_argument("--fps", type=int, default=60, help="擷取的目標 FPS")
-    p.add_argument("--size", type=int, default=640,
-                   help="擷取螢幕中央 size x size 的區域；設 0 代表整個螢幕")
+    p.add_argument("--size", type=int, default=0,
+                   help="擷取螢幕中央 size x size 的區域；0（預設）代表整個螢幕")
     p.add_argument("--region", type=int, nargs=4, metavar=("LEFT", "TOP", "RIGHT", "BOTTOM"),
                    help="自訂擷取區域（會覆蓋 --size）")
-    p.add_argument("--imgsz", type=int, default=640, help="模型輸入尺寸，越小越快")
+    p.add_argument("--imgsz", type=int, default=640,
+                   help="模型輸入尺寸。越小越快；全螢幕時遠處小人物抓不到可調大到 960 或 1280")
     p.add_argument("--conf", type=float, default=0.4, help="信心門檻，低於此值的框不顯示")
     p.add_argument("--monitor", type=int, default=0, help="要擷取的螢幕編號")
     p.add_argument("--device", default=None, help="例如 0（第一張 GPU）或 cpu；預設自動選擇")
-    p.add_argument("--show-scale", type=float, default=0.6, help="預覽視窗縮放比例")
+    p.add_argument("--show-scale", type=float, default=0.5, help="預覽視窗縮放比例")
     p.add_argument("--no-show", action="store_true", help="不顯示預覽視窗")
     return p.parse_args()
 
@@ -50,6 +52,24 @@ def compute_region(args, screen_w, screen_h):
     left = (screen_w - s) // 2
     top = (screen_h - s) // 2
     return (left, top, left + s, top + s)
+
+
+def exclude_window_from_capture(title):
+    """讓預覽視窗不會被螢幕擷取到，避免全螢幕時出現「畫面套畫面」。
+
+    使用 Windows 的 SetWindowDisplayAffinity(WDA_EXCLUDEFROMCAPTURE)，
+    需要 Windows 10 2004（20H1）以上。視窗在你眼中照常顯示，只是擷取畫面裡看不到它。
+    """
+    WDA_EXCLUDEFROMCAPTURE = 0x00000011
+    user32 = ctypes.windll.user32
+    hwnd = user32.FindWindowW(None, title)
+    if not hwnd:
+        print("[警告] 找不到預覽視窗，無法排除擷取")
+        return False
+    if not user32.SetWindowDisplayAffinity(hwnd, WDA_EXCLUDEFROMCAPTURE):
+        print("[警告] 排除擷取失敗（Windows 版本可能太舊），預覽視窗可能會出現在畫面中")
+        return False
+    return True
 
 
 def draw_boxes(frame, boxes, confs):
@@ -88,7 +108,9 @@ def main():
 
     if not args.no_show:
         cv2.namedWindow(WINDOW_NAME, cv2.WINDOW_AUTOSIZE)
-        cv2.moveWindow(WINDOW_NAME, 0, 0)  # 放左上角，盡量避免被擷取到（畫面套畫面）
+        cv2.moveWindow(WINDOW_NAME, 0, 0)
+        cv2.waitKey(1)  # 讓視窗真正建立出來，才找得到它
+        exclude_window_from_capture(WINDOW_NAME)
 
     fps_ema = 0.0
     last = time.perf_counter()
