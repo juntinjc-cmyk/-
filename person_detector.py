@@ -42,6 +42,13 @@ def build_parser():
     p.add_argument("--device", default=None, help="例如 0（第一張 GPU）或 cpu；預設自動選擇")
     p.add_argument("--show-scale", type=float, default=0.5, help="預覽視窗縮放比例")
     p.add_argument("--no-show", action="store_true", help="不顯示預覽視窗")
+    p.add_argument("--no-track", action="store_true", help="關閉追蹤（框可能會閃爍）")
+    p.add_argument("--hold", type=int, default=8,
+                   help="追蹤：人暫時抓不到時，框最多保留幾幀（預設 8，60 FPS 約 0.13 秒）")
+    p.add_argument("--track-low", type=float, default=0.2,
+                   help="追蹤：已經在追的人，信心掉到多低還繼續跟（預設 0.2）")
+    p.add_argument("--smooth", type=float, default=0.7,
+                   help="追蹤：框的平滑程度，0~1。越大越跟手、越小越穩（預設 0.7）")
     p.add_argument("--keep-self", action="store_true",
                    help="不要過濾第一人稱畫面下方的手（預設會過濾）")
     p.add_argument("--self-top", type=float, default=0.5,
@@ -101,6 +108,97 @@ def filter_self(xyxy, confs, h, w, self_top):
     starts_low = xyxy[:, 1] >= h * self_top
     keep = ~(touches_bottom & starts_low)
     return xyxy[keep], confs[keep]
+
+
+def iou_matrix(a, b):
+    """a: (N,4), b: (M,4) 的 xyxy 框，回傳 (N,M) 的 IoU（重疊比例）。"""
+    x1 = np.maximum(a[:, None, 0], b[None, :, 0])
+    y1 = np.maximum(a[:, None, 1], b[None, :, 1])
+    x2 = np.minimum(a[:, None, 2], b[None, :, 2])
+    y2 = np.minimum(a[:, None, 3], b[None, :, 3])
+    inter = np.clip(x2 - x1, 0, None) * np.clip(y2 - y1, 0, None)
+    area_a = (a[:, 2] - a[:, 0]) * (a[:, 3] - a[:, 1])
+    area_b = (b[:, 2] - b[:, 0]) * (b[:, 3] - b[:, 1])
+    return inter / (area_a[:, None] + area_b[None, :] - inter + 1e-9)
+
+
+class BoxTracker:
+    """簡單的追蹤器，讓框在快速運動時不閃爍、不跳動。
+
+    - 雙門檻：新出現的人要信心 >= high 才開始顯示；已經在追蹤的人，
+      畫面糊掉分數變低（>= track_low）也繼續跟著。
+    - 暫時抓不到時，依照之前的移動速度把框往前推，最多撐 hold 幀才消失。
+    - 位置做平滑處理，減少每幀的小抖動；smooth 越大越跟手、越小越穩。
+    """
+
+    def __init__(self, high=0.4, hold=8, smooth=0.7, match_iou=0.2):
+        self.high = high
+        self.hold = hold
+        self.smooth = smooth
+        self.match_iou = match_iou
+        self.boxes = np.zeros((0, 4), dtype=np.float32)
+        self.vel = np.zeros((0, 4), dtype=np.float32)
+        self.conf = np.zeros((0,), dtype=np.float32)
+        self.misses = np.zeros((0,), dtype=np.int32)
+
+    def update(self, det, det_conf, h, w):
+        det = det.astype(np.float32)
+        pred = self.boxes + self.vel  # 依照速度預測這一幀的位置（快速運動時比較對得上）
+
+        matched_t, matched_d = [], []
+        if len(pred) and len(det):
+            iou = iou_matrix(pred, det)
+            # 快速運動時框可能幾乎不重疊，所以也看「中心點距離 / 框的大小」
+            pc = (pred[:, :2] + pred[:, 2:]) / 2
+            dc = (det[:, :2] + det[:, 2:]) / 2
+            size = np.maximum(pred[:, 2] - pred[:, 0], pred[:, 3] - pred[:, 1])[:, None] + 1e-6
+            dist = np.linalg.norm(pc[:, None, :] - dc[None, :, :], axis=2) / size
+            ok = (iou >= self.match_iou) | (dist <= 0.5)
+            score = np.where(ok, iou - dist, -np.inf)
+            # 由最像的開始配對，每個追蹤對象和偵測框各只配一次
+            for flat in np.argsort(-score, axis=None):
+                t, d = divmod(int(flat), score.shape[1])
+                if not np.isfinite(score[t, d]):
+                    break
+                if t in matched_t or d in matched_d:
+                    continue
+                matched_t.append(t)
+                matched_d.append(d)
+
+        a = self.smooth
+        for t, d in zip(matched_t, matched_d):
+            new = a * det[d] + (1 - a) * pred[t]
+            self.vel[t] = 0.5 * self.vel[t] + 0.5 * (det[d] - self.boxes[t])
+            self.boxes[t] = new
+            self.conf[t] = det_conf[d]
+            self.misses[t] = 0
+
+        # 沒配到的追蹤對象：沿著速度繼續走，速度逐漸減慢
+        lost = np.ones(len(self.boxes), dtype=bool)
+        lost[matched_t] = False
+        self.boxes[lost] = pred[lost]
+        self.vel[lost] *= 0.8
+        self.misses[lost] += 1
+
+        # 沒配到的偵測框：信心夠高才當成新的人
+        new_d = [d for d in range(len(det)) if d not in matched_d and det_conf[d] >= self.high]
+        if new_d:
+            self.boxes = np.concatenate([self.boxes, det[new_d]])
+            self.vel = np.concatenate([self.vel, np.zeros((len(new_d), 4), np.float32)])
+            self.conf = np.concatenate([self.conf, det_conf[new_d].astype(np.float32)])
+            self.misses = np.concatenate([self.misses, np.zeros(len(new_d), np.int32)])
+
+        # 太久沒抓到、或已經跑出畫面的就刪掉
+        b = self.boxes
+        inside = (b[:, 2] > 0) & (b[:, 0] < w) & (b[:, 3] > 0) & (b[:, 1] < h)
+        alive = (self.misses <= self.hold) & inside
+        self.boxes, self.vel = self.boxes[alive], self.vel[alive]
+        self.conf, self.misses = self.conf[alive], self.misses[alive]
+
+        out = self.boxes.copy()
+        out[:, 0::2] = np.clip(out[:, 0::2], 0, w - 1)
+        out[:, 1::2] = np.clip(out[:, 1::2], 0, h - 1)
+        return out.round().astype(np.int32), self.conf.copy()
 
 
 class GpuPreprocessor:
@@ -175,7 +273,9 @@ class Detector:
             imgsz, (h, w) = list(args.imgsz[:2]), tuple(args.imgsz[:2])
 
         # 預測參數只算一次，迴圈裡重複使用
-        self.kwargs = dict(classes=[PERSON_CLASS_ID], conf=args.conf, imgsz=imgsz,
+        # 有追蹤時，模型先用較低的門檻抓「可能是人」的框，再交給追蹤器決定要不要顯示
+        det_conf = args.conf if args.no_track else min(args.conf, args.track_low)
+        self.kwargs = dict(classes=[PERSON_CLASS_ID], conf=det_conf, imgsz=imgsz,
                            device=device, verbose=False)
         if gpu and not args.model.endswith(".engine"):
             # .engine 轉換時已經是 FP16，不用再指定。
@@ -186,7 +286,9 @@ class Detector:
             else:
                 self.kwargs["half"] = True
 
-        self.conf = args.conf
+        self.conf = det_conf
+        self.tracker = None if args.no_track else BoxTracker(
+            high=args.conf, hold=args.hold, smooth=args.smooth)
         self.keep_self = args.keep_self
         self.self_top = args.self_top
         self.iou = 0.7          # 跟 ultralytics 預設一樣
@@ -266,6 +368,8 @@ class Detector:
         xyxy, confs = self._predict_fast(frame) if self.fast else self._predict_ultralytics(frame)
         if not self.keep_self:
             xyxy, confs = filter_self(xyxy, confs, frame.shape[0], frame.shape[1], self.self_top)
+        if self.tracker is not None:
+            xyxy, confs = self.tracker.update(xyxy, confs, frame.shape[0], frame.shape[1])
         return xyxy, confs
 
 
