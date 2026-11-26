@@ -116,11 +116,30 @@ class GpuPreprocessor:
         self.pinned.numpy()[...] = small
         g = self.pinned.to(self.device, non_blocking=True)
 
-        x = g.permute(2, 0, 1).flip(0).float().div_(255.0)  # HWC BGR -> CHW RGB, 0~1
+        x = g[..., :3].permute(2, 0, 1).flip(0).float().div_(255.0)  # HWC BGR(A) -> CHW RGB, 0~1
         canvas = torch.full((1, 3, self.th, self.tw), 114 / 255.0,
                             device=self.device, dtype=torch.float32)  # 灰色補邊，跟 ultralytics 一樣
         canvas[0, :, :nh, :nw] = x
         return canvas, r
+
+
+def nms_numpy(boxes, scores, iou_thr):
+    """標準的非極大值抑制：重疊太多的框只留分數最高的那個。回傳保留的索引。"""
+    order = scores.argsort()[::-1]
+    areas = (boxes[:, 2] - boxes[:, 0]) * (boxes[:, 3] - boxes[:, 1])
+    keep = []
+    while order.size:
+        i = order[0]
+        keep.append(i)
+        rest = order[1:]
+        xx1 = np.maximum(boxes[i, 0], boxes[rest, 0])
+        yy1 = np.maximum(boxes[i, 1], boxes[rest, 1])
+        xx2 = np.minimum(boxes[i, 2], boxes[rest, 2])
+        yy2 = np.minimum(boxes[i, 3], boxes[rest, 3])
+        inter = np.clip(xx2 - xx1, 0, None) * np.clip(yy2 - yy1, 0, None)
+        iou = inter / (areas[i] + areas[rest] - inter + 1e-9)
+        order = rest[iou <= iou_thr]
+    return np.array(keep, dtype=np.int64)
 
 
 class Detector:
@@ -169,8 +188,6 @@ class Detector:
         self.fast = False
         if gpu and not args.cpu_preprocess:
             try:
-                from torchvision.ops import nms
-                self._nms = nms
                 self.backend = self.model.predictor.model
                 self.in_dtype = torch.float16 if getattr(self.backend, "fp16", False) else torch.float32
                 self.pre = GpuPreprocessor((h, w), device)
@@ -196,9 +213,6 @@ class Detector:
         out = self.backend(x)
         if isinstance(out, (list, tuple)):
             out = out[0]
-        torch.cuda.synchronize()
-        t2 = time.perf_counter()
-
         out = out[0]                       # (4 + 類別數, 候選框數)
         nc = len(self.model.names)
         if out.shape[0] != 4 + nc:
@@ -206,22 +220,28 @@ class Detector:
                 out = out.T
             else:
                 raise RuntimeError(f"不支援的模型輸出形狀 {tuple(out.shape)}")
-        scores = out[4 + PERSON_CLASS_ID].float()
+        # 只取 cx, cy, w, h 和「人」的分數這 5 列，一次搬回 CPU。
+        # 在 GPU 上做很多小步驟，每一步都要等顯卡（顯卡同時在播影片），反而比較慢。
+        sub = out[[0, 1, 2, 3, 4 + PERSON_CLASS_ID]].float().cpu().numpy()
+        t2 = time.perf_counter()
+
+        scores = sub[4]
         keep = scores > self.conf
-        b = out[:4, keep].T.float()        # cx, cy, w, h（模型輸入的座標）
-        sc = scores[keep]
-        if b.shape[0] == 0:
+        if not keep.any():
             xyxy, conf = np.zeros((0, 4), dtype=np.int32), np.zeros((0,), dtype=np.float32)
         else:
-            boxes = torch.cat([b[:, :2] - b[:, 2:] / 2, b[:, :2] + b[:, 2:] / 2], dim=1)
-            idx = self._nms(boxes, sc, self.iou)[: self.max_det]
+            cx, cy, bw, bh = sub[0, keep], sub[1, keep], sub[2, keep], sub[3, keep]
+            sc = scores[keep]
+            boxes = np.stack([cx - bw / 2, cy - bh / 2, cx + bw / 2, cy + bh / 2], axis=1)
+            idx = nms_numpy(boxes, sc, self.iou)[: self.max_det]
             boxes = boxes[idx] / r         # 換回原始畫面的座標
             fh, fw = frame.shape[:2]
-            boxes[:, 0::2] = boxes[:, 0::2].clamp(0, fw - 1)
-            boxes[:, 1::2] = boxes[:, 1::2].clamp(0, fh - 1)
-            xyxy = boxes.round().int().cpu().numpy()
-            conf = sc[idx].cpu().numpy()
+            np.clip(boxes[:, 0::2], 0, fw - 1, out=boxes[:, 0::2])
+            np.clip(boxes[:, 1::2], 0, fh - 1, out=boxes[:, 1::2])
+            xyxy = boxes.round().astype(np.int32)
+            conf = sc[idx]
         t3 = time.perf_counter()
+        # 推論包含把結果搬回 CPU（要等顯卡算完）
         self.speed = {"preprocess": (t1 - t0) * 1000, "inference": (t2 - t1) * 1000,
                       "postprocess": (t3 - t2) * 1000}
         return xyxy, conf

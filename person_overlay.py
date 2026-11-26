@@ -72,7 +72,9 @@ def run_detection(args, conn):
     from person_detector import Detector, compute_region
 
     detector = Detector(args)
-    camera = dxcam.create(output_idx=args.monitor, output_color="BGR")
+    # 快速流程可以直接吃 BGRA，省掉 dxcam 每幀把 4K 畫面轉成 BGR 的 CPU 工作
+    color = "BGRA" if detector.fast else "BGR"
+    camera = dxcam.create(output_idx=args.monitor, output_color=color)
     region = compute_region(args, camera.width, camera.height)
     left, top = region[0], region[1]
     print(f"[資訊] 螢幕 {camera.width}x{camera.height}，擷取區域 {region}，目標 {args.fps} FPS")
