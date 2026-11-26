@@ -43,7 +43,7 @@ def build_parser():
     p.add_argument("--show-scale", type=float, default=0.5, help="預覽視窗縮放比例")
     p.add_argument("--no-show", action="store_true", help="不顯示預覽視窗")
     p.add_argument("--cpu-preprocess", action="store_true",
-                   help="改回 ultralytics 內建的 CPU 前處理（GPU 前處理有問題時用）")
+                   help="改用 ultralytics 原本的完整流程（較慢；快速流程有問題時才用）")
     return p
 
 
@@ -154,25 +154,83 @@ class Detector:
             else:
                 self.kwargs["half"] = True
 
-        self.pre = GpuPreprocessor((h, w), device) if gpu and not args.cpu_preprocess else None
-        print(f"[資訊] 前處理: {'GPU' if self.pre else 'CPU（ultralytics 內建）'}")
+        self.conf = args.conf
+        self.iou = 0.7          # 跟 ultralytics 預設一樣
+        self.max_det = 300
 
-        # 暖機：前幾次推論比較慢，先跑幾次空白圖
+        # 暖機：先用 ultralytics 原本的流程跑幾次，順便讓它把模型（AutoBackend）準備好
         dummy = np.zeros((h, w, 3), dtype=np.uint8)
         for _ in range(3):
-            self(dummy)
+            self._predict_ultralytics(dummy)
+
+        # 快速流程：自己做前處理 + 直接呼叫模型 + 只針對「人」的精簡後處理。
+        # ultralytics 的後處理要處理 80 個類別、建立 Results 物件，實測要 8~10 ms，
+        # 精簡版只看「人」這一類，全部在 GPU 上做，通常不到 1 ms。
+        self.fast = False
+        if gpu and not args.cpu_preprocess:
+            try:
+                from torchvision.ops import nms
+                self._nms = nms
+                self.backend = self.model.predictor.model
+                self.in_dtype = torch.float16 if getattr(self.backend, "fp16", False) else torch.float32
+                self.pre = GpuPreprocessor((h, w), device)
+                self.fast = True
+                for _ in range(3):
+                    self._predict_fast(dummy)
+            except Exception as e:  # 任何問題就退回 ultralytics 原本的流程
+                self.fast = False
+                print(f"[警告] 快速流程無法使用，改用 ultralytics 原本的流程：{e!r}")
+        print(f"[資訊] 偵測流程: {'快速（GPU 前處理 + 精簡後處理）' if self.fast else 'ultralytics 原本的流程'}")
+
+    def _predict_ultralytics(self, frame):
+        res = self.model.predict(frame, **self.kwargs)[0]
+        self.speed = res.speed
+        return res.boxes.xyxy.cpu().numpy().astype(int), res.boxes.conf.cpu().numpy()
+
+    def _predict_fast(self, frame):
+        t0 = time.perf_counter()
+        x, r = self.pre(frame)
+        x = x.to(self.in_dtype)
+        t1 = time.perf_counter()
+
+        out = self.backend(x)
+        if isinstance(out, (list, tuple)):
+            out = out[0]
+        torch.cuda.synchronize()
+        t2 = time.perf_counter()
+
+        out = out[0]                       # (4 + 類別數, 候選框數)
+        nc = len(self.model.names)
+        if out.shape[0] != 4 + nc:
+            if out.shape[-1] == 4 + nc:
+                out = out.T
+            else:
+                raise RuntimeError(f"不支援的模型輸出形狀 {tuple(out.shape)}")
+        scores = out[4 + PERSON_CLASS_ID].float()
+        keep = scores > self.conf
+        b = out[:4, keep].T.float()        # cx, cy, w, h（模型輸入的座標）
+        sc = scores[keep]
+        if b.shape[0] == 0:
+            xyxy, conf = np.zeros((0, 4), dtype=np.int32), np.zeros((0,), dtype=np.float32)
+        else:
+            boxes = torch.cat([b[:, :2] - b[:, 2:] / 2, b[:, :2] + b[:, 2:] / 2], dim=1)
+            idx = self._nms(boxes, sc, self.iou)[: self.max_det]
+            boxes = boxes[idx] / r         # 換回原始畫面的座標
+            fh, fw = frame.shape[:2]
+            boxes[:, 0::2] = boxes[:, 0::2].clamp(0, fw - 1)
+            boxes[:, 1::2] = boxes[:, 1::2].clamp(0, fh - 1)
+            xyxy = boxes.round().int().cpu().numpy()
+            conf = sc[idx].cpu().numpy()
+        t3 = time.perf_counter()
+        self.speed = {"preprocess": (t1 - t0) * 1000, "inference": (t2 - t1) * 1000,
+                      "postprocess": (t3 - t2) * 1000}
+        return xyxy, conf
 
     def __call__(self, frame):
-        """self.speed 會記錄 ultralytics 內部的「前處理 / 推論 / 後處理」毫秒數。"""
-        if self.pre is not None:
-            x, r = self.pre(frame)
-            res = self.model.predict(x, **self.kwargs)[0]
-            xyxy = (res.boxes.xyxy / r).round().int().cpu().numpy()
-        else:
-            res = self.model.predict(frame, **self.kwargs)[0]
-            xyxy = res.boxes.xyxy.cpu().numpy().astype(int)
-        self.speed = res.speed
-        return xyxy, res.boxes.conf.cpu().numpy()
+        """回傳 (框 xyxy 整數陣列, 信心分數陣列)。self.speed 記錄前處理 / 推論 / 後處理毫秒數。"""
+        if self.fast:
+            return self._predict_fast(frame)
+        return self._predict_ultralytics(frame)
 
 
 def main():
