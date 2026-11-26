@@ -33,7 +33,7 @@ LABEL_TEXT_COLOR = QColor(0, 0, 0)
 class DetectorThread(QThread):
     """背景執行緒：擷取螢幕 → 偵測 → 把框（螢幕實體像素座標）送給疊加視窗。"""
 
-    detections = Signal(object)  # list[(x1, y1, x2, y2, conf)]
+    detections = Signal(object, float)  # (list[(x1, y1, x2, y2, conf)], fps)
 
     def __init__(self, args):
         super().__init__()
@@ -66,12 +66,11 @@ class DetectorThread(QThread):
                 confs = result.boxes.conf.cpu().numpy()
                 boxes = [(x1 + left, y1 + top, x2 + left, y2 + top, float(c))
                          for (x1, y1, x2, y2), c in zip(xyxy, confs)]
-                self.detections.emit(boxes)
-
                 now = time.perf_counter()
                 dt = now - last
                 last = now
                 fps_ema = (1.0 / dt) if fps_ema == 0 else fps_ema * 0.9 + (1.0 / dt) * 0.1
+                self.detections.emit(boxes, fps_ema)
                 if now - last_print >= 1.0:
                     print(f"FPS {fps_ema:5.1f} | 人數 {len(boxes)}")
                     last_print = now
@@ -79,7 +78,7 @@ class DetectorThread(QThread):
             camera.stop()
             del camera
             # 清掉螢幕上殘留的框
-            self.detections.emit([])
+            self.detections.emit([], -1.0)
 
 
 class Overlay(QWidget):
@@ -94,9 +93,11 @@ class Overlay(QWidget):
         self.setAttribute(Qt.WA_ShowWithoutActivating)
         self.setGeometry(screen.geometry())
         self.boxes = []
+        self.fps = -1.0
 
-    def set_boxes(self, boxes):
+    def set_boxes(self, boxes, fps):
         self.boxes = boxes
+        self.fps = fps
         self.update()  # 觸發重畫
 
     def paintEvent(self, _event):
@@ -123,6 +124,18 @@ class Overlay(QWidget):
             p.fillRect(QRect(x1, ty, tw, th), BOX_COLOR)
             p.setPen(LABEL_TEXT_COLOR)
             p.drawText(QRect(x1, ty, tw, th), Qt.AlignCenter, label)
+
+        # 左上角顯示 FPS 和人數（fps < 0 代表已停止，不顯示）
+        if self.fps >= 0:
+            hud = f"FPS {self.fps:5.1f}  |  persons {len(self.boxes)}"
+            font.setPixelSize(32)
+            font.setBold(True)
+            p.setFont(font)
+            hm = p.fontMetrics()
+            rect = QRect(20, 20, hm.horizontalAdvance(hud) + 24, hm.height() + 12)
+            p.fillRect(rect, QColor(0, 0, 0, 160))
+            p.setPen(BOX_COLOR)
+            p.drawText(rect, Qt.AlignCenter, hud)
         p.end()
 
 
