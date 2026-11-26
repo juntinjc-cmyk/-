@@ -2,6 +2,8 @@
 螢幕疊加版人物偵測：不開預覽視窗，綠框直接畫在螢幕上（例如看 YouTube 影片時）。
 
 - 透明、置頂、滑鼠點得穿的視窗蓋在整個螢幕上，只畫框。
+- 透明的做法是「色鍵」：視窗裡純黑色的像素會被 Windows 當成透明。
+  每幀只重畫框的邊線那幾條細長區域，不用整個 4K 畫面搬來搬去，所以很省。
 - 預設：疊加視窗會被排除在螢幕擷取之外，所以框不會被下一幀再偵測到，
   但錄影軟體（OBS、剪取工具）也錄不到框。
 - 加 --recordable：錄影軟體錄得到框。代價是框也會被 dxcam 擷取進偵測畫面，
@@ -15,9 +17,11 @@
 結束：回到終端機按 Ctrl + C。
 """
 
+import ctypes
 import signal
 import sys
 import time
+from ctypes import wintypes
 
 import dxcam
 from PySide6.QtCore import QRect, Qt, QThread, QTimer, Signal
@@ -27,7 +31,36 @@ from PySide6.QtWidgets import QApplication, QWidget
 from person_detector import build_parser, Detector, compute_region, exclude_hwnd_from_capture
 
 BOX_COLOR = QColor(0, 255, 0)
-LABEL_TEXT_COLOR = QColor(0, 0, 0)
+KEY_COLOR = QColor(0, 0, 0)          # 純黑 = 透明，畫面上其他地方都不能用純黑
+LABEL_TEXT_COLOR = QColor(12, 12, 12)
+HUD_BG_COLOR = QColor(24, 24, 24)
+HUD_INTERVAL = 0.25                  # 左上角 FPS 每 0.25 秒更新一次就夠了
+
+GWL_EXSTYLE = -20
+WS_EX_LAYERED = 0x00080000
+WS_EX_TRANSPARENT = 0x00000020
+WS_EX_TOOLWINDOW = 0x00000080
+WS_EX_NOACTIVATE = 0x08000000
+LWA_COLORKEY = 0x1
+
+
+def apply_color_key(hwnd):
+    """把視窗設成「純黑色 = 透明」、滑鼠點得穿。成功回傳 True。"""
+    user32 = ctypes.windll.user32
+    user32.GetWindowLongPtrW.restype = ctypes.c_ssize_t
+    user32.SetWindowLongPtrW.argtypes = [wintypes.HWND, ctypes.c_int, ctypes.c_ssize_t]
+    ex = user32.GetWindowLongPtrW(wintypes.HWND(hwnd), GWL_EXSTYLE)
+    ex |= WS_EX_LAYERED | WS_EX_TRANSPARENT | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE
+    user32.SetWindowLongPtrW(wintypes.HWND(hwnd), GWL_EXSTYLE, ex)
+    if not user32.SetLayeredWindowAttributes(wintypes.HWND(hwnd), 0x000000, 0, LWA_COLORKEY):
+        return False
+    # 確認真的套用成功，避免整個螢幕被黑色蓋住
+    key = wintypes.DWORD()
+    alpha = ctypes.c_ubyte()
+    flags = wintypes.DWORD()
+    ok = user32.GetLayeredWindowAttributes(wintypes.HWND(hwnd), ctypes.byref(key),
+                                           ctypes.byref(alpha), ctypes.byref(flags))
+    return bool(ok) and bool(flags.value & LWA_COLORKEY) and key.value == 0
 
 
 class DetectorThread(QThread):
@@ -96,38 +129,55 @@ class Overlay(QWidget):
                          | Qt.WindowStaysOnTopHint
                          | Qt.Tool                        # 不出現在工作列
                          | Qt.WindowTransparentForInput)  # 滑鼠點得穿
-        self.setAttribute(Qt.WA_TranslucentBackground)
+        # 不用 WA_TranslucentBackground（每幀要把整個 4K 畫面送給 Windows，很慢），
+        # 改用色鍵：自己把背景畫成純黑，Windows 會把純黑當成透明。
+        self.setAttribute(Qt.WA_OpaquePaintEvent)
+        self.setAttribute(Qt.WA_NoSystemBackground)
         self.setAttribute(Qt.WA_TransparentForMouseEvents)
         self.setAttribute(Qt.WA_ShowWithoutActivating)
         self.setGeometry(screen.geometry())
         self.boxes = []
         self.fps = -1.0
+        self.hud_fps = -1.0
+        self._hud_time = 0.0
         self._dirty = QRegion()
 
-    def _region_for(self, boxes):
-        """算出這些框（含標籤）和左上角 FPS 佔用的範圍，換成 Qt 的邏輯座標。"""
+    HUD_RECT = (20, 20, 20 + 700, 20 + 70)  # 左上角 FPS 區塊（實體像素）
+
+    def _to_logical(self, x1, y1, x2, y2, pad=6):
         dpr = self.devicePixelRatioF()
-        pad = 6
+        return QRect(int((x1 - pad) / dpr), int((y1 - pad) / dpr),
+                     int((x2 - x1 + 2 * pad) / dpr) + 2, int((y2 - y1 + 2 * pad) / dpr) + 2)
+
+    def _region_for(self, boxes):
+        """只算框的四條邊和標籤（不是整個框的內部），換成 Qt 的邏輯座標。"""
         label_h = 40
         region = QRegion()
-        rects = [(20, 20, 20 + 700, 20 + 70)]  # 左上角 FPS 區塊
-        rects += [(x1, y1 - label_h, max(x2, x1 + 260), y2) for x1, y1, x2, y2, _ in boxes]
-        for x1, y1, x2, y2 in rects:
-            region += QRect(int((x1 - pad) / dpr), int((y1 - pad) / dpr),
-                            int((x2 - x1 + 2 * pad) / dpr) + 2, int((y2 - y1 + 2 * pad) / dpr) + 2)
+        for x1, y1, x2, y2, _ in boxes:
+            region += self._to_logical(x1, y1 - label_h, max(x2, x1 + 260), y1 + label_h)  # 上邊 + 標籤
+            region += self._to_logical(x1, y2, x2, y2)                            # 下邊
+            region += self._to_logical(x1, y1, x1, y2)                            # 左邊
+            region += self._to_logical(x2, y1, x2, y2)                            # 右邊
         return region
 
     def set_boxes(self, boxes, fps):
         self.boxes = boxes
         self.fps = fps
-        # 只重畫「舊的框 + 新的框」所在的範圍，不要每次重畫整個 4K 螢幕，
-        # 否則透明全螢幕視窗每幀都要搬 30 多 MB 的畫面，會拖慢速度。
+        # 只重畫「舊的框 + 新的框」的邊線
         new_dirty = self._region_for(boxes)
-        self.update(self._dirty + new_dirty)
+        dirty = self._dirty + new_dirty
+        now = time.perf_counter()
+        if fps < 0 or now - self._hud_time >= HUD_INTERVAL:
+            self.hud_fps = fps
+            self._hud_time = now
+            dirty += self._to_logical(*self.HUD_RECT)
+        self.update(dirty)
         self._dirty = new_dirty
 
-    def paintEvent(self, _event):
+    def paintEvent(self, event):
         p = QPainter(self)
+        # 先把要重畫的範圍塗成純黑（= 透明），清掉上一幀的框
+        p.fillRect(event.rect(), KEY_COLOR)
         # dxcam 給的是實體像素；Windows 有縮放（例如 4K 開 150%）時，Qt 用的是縮放後的座標。
         # 這裡把畫布縮回實體像素，框就會對準。
         dpr = self.devicePixelRatioF()
@@ -152,14 +202,14 @@ class Overlay(QWidget):
             p.drawText(QRect(x1, ty, tw, th), Qt.AlignCenter, label)
 
         # 左上角顯示 FPS 和人數（fps < 0 代表已停止，不顯示）
-        if self.fps >= 0:
-            hud = f"FPS {self.fps:5.1f}  |  persons {len(self.boxes)}"
+        if self.hud_fps >= 0:
+            hud = f"FPS {self.hud_fps:5.1f}  |  persons {len(self.boxes)}"
             font.setPixelSize(32)
             font.setBold(True)
             p.setFont(font)
             hm = p.fontMetrics()
             rect = QRect(20, 20, hm.horizontalAdvance(hud) + 24, hm.height() + 12)
-            p.fillRect(rect, QColor(0, 0, 0, 160))
+            p.fillRect(rect, HUD_BG_COLOR)
             p.setPen(BOX_COLOR)
             p.drawText(rect, Qt.AlignCenter, hud)
         p.end()
@@ -180,11 +230,19 @@ def main():
 
     app = QApplication(sys.argv)
     overlay = Overlay(pick_screen(args.monitor))
+    hwnd = int(overlay.winId())  # 先建立視窗（還不顯示）
+    if not apply_color_key(hwnd):
+        print("[錯誤] 無法設定透明疊加視窗，程式結束")
+        return
     overlay.show()
+    if not apply_color_key(hwnd):  # 顯示後再確認一次，失敗就立刻關掉，避免黑畫面蓋住螢幕
+        overlay.close()
+        print("[錯誤] 無法設定透明疊加視窗，程式結束")
+        return
     if args.recordable:
         print("[資訊] 可錄影模式：錄影軟體錄得到框")
     else:
-        exclude_hwnd_from_capture(int(overlay.winId()))
+        exclude_hwnd_from_capture(hwnd)
 
     worker = DetectorThread(args)
     worker.detections.connect(overlay.set_boxes)  # 跨執行緒，Qt 會自動排到主執行緒執行
