@@ -7,8 +7,10 @@
 ## 安裝
 
 ```bash
-# 1. 先裝 CUDA 版 PyTorch（版本請依 https://pytorch.org 選擇，這裡以 CUDA 12.1 為例）
-pip install torch torchvision --index-url https://download.pytorch.org/whl/cu121
+# 1. 先裝 CUDA 版 PyTorch
+#    RTX 50 系列（5060/5070/5080/5090，Blackwell 架構）一定要用 CUDA 12.8 以上的版本（cu128）
+#    舊版（cu121、cu124）會出現 "no kernel image is available for execution on the device"
+pip install torch torchvision --index-url https://download.pytorch.org/whl/cu128
 
 # 2. 其他套件
 pip install -r requirements.txt
@@ -39,7 +41,7 @@ python person_detector.py
 1. 確認啟動時印出的是 `CUDA - 你的顯卡`，不是 CPU。
 2. 用較小的擷取區域（預設中央 640×640 就是為了速度）。
 3. 調小 `--imgsz`，例如 `--imgsz 416`。
-4. 進一步加速：把模型轉成 TensorRT
+4. 進一步加速：把模型轉成 TensorRT（RTX 50 系列需要 TensorRT 10.8 以上）
    ```bash
    yolo export model=yolo11n.pt format=engine half=True imgsz=640
    python person_detector.py --model yolo11n.engine
