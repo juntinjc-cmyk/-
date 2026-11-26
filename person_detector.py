@@ -48,7 +48,9 @@ def build_parser():
     p.add_argument("--track-low", type=float, default=0.2,
                    help="追蹤：已經在追的人，信心掉到多低還繼續跟（預設 0.2）")
     p.add_argument("--smooth", type=float, default=0.7,
-                   help="追蹤：框的平滑程度，0~1。越大越跟手、越小越穩（預設 0.7）")
+                   help="追蹤：人移動很快時框的跟手程度，0~1，越大越跟手（預設 0.7）")
+    p.add_argument("--steady", type=float, default=0.15,
+                   help="追蹤：人幾乎沒動時框的跟手程度，0~1，越小越穩、越不抖（預設 0.15）")
     p.add_argument("--min-height", type=float, default=0.0,
                    help="框的高度小於畫面這個比例就不顯示（過濾太遠的人），例如 0.08；預設 0 不過濾")
     p.add_argument("--max-boxes", type=int, default=0,
@@ -142,10 +144,12 @@ class BoxTracker:
     - 位置做平滑處理，減少每幀的小抖動；smooth 越大越跟手、越小越穩。
     """
 
-    def __init__(self, high=0.4, hold=8, smooth=0.7, match_iou=0.2, min_hits=2, dup_iou=0.5):
+    def __init__(self, high=0.4, hold=8, smooth=0.7, steady=0.15, match_iou=0.2, min_hits=2,
+                 dup_iou=0.5):
         self.high = high
         self.hold = hold
-        self.smooth = smooth
+        self.smooth = smooth    # 移動很快時的跟手程度
+        self.steady = steady    # 幾乎沒動時的跟手程度（越小越穩，越不抖）
         self.match_iou = match_iou
         self.min_hits = min_hits
         self.dup_iou = dup_iou
@@ -179,10 +183,15 @@ class BoxTracker:
                 matched_t.append(t)
                 matched_d.append(d)
 
-        a = self.smooth
         for t, d in zip(matched_t, matched_d):
+            # 自動調整平滑程度：偵測框只偏一點點（模型本身的小誤差）→ 幾乎不動，避免抖動；
+            # 偏很多（人真的在動）→ 快速跟上。
+            size = max(pred[t, 2] - pred[t, 0], pred[t, 3] - pred[t, 1], 1.0)
+            move = np.abs(det[d] - pred[t]).mean() / size
+            k = np.clip((move - 0.01) / 0.08, 0.0, 1.0)
+            a = self.steady + (self.smooth - self.steady) * k
             new = a * det[d] + (1 - a) * pred[t]
-            self.vel[t] = 0.5 * self.vel[t] + 0.5 * (det[d] - self.boxes[t])
+            self.vel[t] = 0.7 * self.vel[t] + 0.3 * (new - self.boxes[t])
             self.boxes[t] = new
             self.conf[t] = det_conf[d]
             self.misses[t] = 0
@@ -354,7 +363,7 @@ class Detector:
 
         self.conf = det_conf
         self.tracker = None if args.no_track else BoxTracker(
-            high=args.conf, hold=args.hold, smooth=args.smooth)
+            high=args.conf, hold=args.hold, smooth=args.smooth, steady=args.steady)
         self.keep_self = args.keep_self
         self.min_height = args.min_height
         self.max_boxes = args.max_boxes
