@@ -24,7 +24,7 @@ PERSON_CLASS_ID = 0  # COCO 資料集裡 "person" 的類別編號
 WINDOW_NAME = "Person Detector"
 
 
-def parse_args():
+def build_parser():
     p = argparse.ArgumentParser(description="dxcam + YOLO 即時人物偵測")
     p.add_argument("--model", default="yolo11n.pt",
                    help="YOLO 模型檔（第一次執行會自動下載）。n 最快，s/m 較準但較慢")
@@ -40,7 +40,7 @@ def parse_args():
     p.add_argument("--device", default=None, help="例如 0（第一張 GPU）或 cpu；預設自動選擇")
     p.add_argument("--show-scale", type=float, default=0.5, help="預覽視窗縮放比例")
     p.add_argument("--no-show", action="store_true", help="不顯示預覽視窗")
-    return p.parse_args()
+    return p
 
 
 def compute_region(args, screen_w, screen_h):
@@ -54,22 +54,25 @@ def compute_region(args, screen_w, screen_h):
     return (left, top, left + s, top + s)
 
 
-def exclude_window_from_capture(title):
-    """讓預覽視窗不會被螢幕擷取到，避免全螢幕時出現「畫面套畫面」。
+def exclude_hwnd_from_capture(hwnd):
+    """讓視窗不會被螢幕擷取到，避免它出現在偵測的畫面裡（畫面套畫面）。
 
     使用 Windows 的 SetWindowDisplayAffinity(WDA_EXCLUDEFROMCAPTURE)，
     需要 Windows 10 2004（20H1）以上。視窗在你眼中照常顯示，只是擷取畫面裡看不到它。
     """
     WDA_EXCLUDEFROMCAPTURE = 0x00000011
-    user32 = ctypes.windll.user32
-    hwnd = user32.FindWindowW(None, title)
+    if not ctypes.windll.user32.SetWindowDisplayAffinity(hwnd, WDA_EXCLUDEFROMCAPTURE):
+        print("[警告] 排除擷取失敗（Windows 版本可能太舊），視窗可能會出現在擷取畫面中")
+        return False
+    return True
+
+
+def exclude_window_from_capture(title):
+    hwnd = ctypes.windll.user32.FindWindowW(None, title)
     if not hwnd:
         print("[警告] 找不到預覽視窗，無法排除擷取")
         return False
-    if not user32.SetWindowDisplayAffinity(hwnd, WDA_EXCLUDEFROMCAPTURE):
-        print("[警告] 排除擷取失敗（Windows 版本可能太舊），預覽視窗可能會出現在畫面中")
-        return False
-    return True
+    return exclude_hwnd_from_capture(hwnd)
 
 
 def draw_boxes(frame, boxes, confs):
@@ -83,10 +86,8 @@ def draw_boxes(frame, boxes, confs):
                     cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 0), 1, cv2.LINE_AA)
 
 
-def main():
-    args = parse_args()
-
-    # ---- 模型 ----
+def load_model(args):
+    """載入模型、暖機，回傳 (model, 預測參數)。"""
     use_cuda = torch.cuda.is_available()
     device = args.device if args.device is not None else (0 if use_cuda else "cpu")
     half = use_cuda and str(device) != "cpu"  # GPU 上用 FP16 加速
@@ -111,6 +112,12 @@ def main():
     # 暖機：第一次推論比較慢，先跑一次空白圖
     model.predict(np.zeros((args.imgsz, args.imgsz, 3), dtype=np.uint8),
                   **pred_kwargs)
+    return model, pred_kwargs
+
+
+def main():
+    args = build_parser().parse_args()
+    model, pred_kwargs = load_model(args)
 
     # ---- 螢幕擷取 ----
     camera = dxcam.create(output_idx=args.monitor, output_color="BGR")

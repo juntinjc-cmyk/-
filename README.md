@@ -36,6 +36,18 @@ python person_detector.py
 | `--show-scale` | 0.5 | 預覽視窗縮放 |
 | `--no-show` | – | 不開視窗，只印 FPS |
 
+## 螢幕疊加模式（框直接畫在螢幕上）
+
+不開預覽視窗，綠框直接疊在螢幕上，適合邊看影片邊偵測。疊加層透明、滑鼠點得穿，也不會被擷取進偵測畫面。
+
+```bash
+python person_overlay.py --model yolo11n.engine
+```
+
+要結束：回到終端機按 `Ctrl + C`。參數跟 `person_detector.py` 相同（`--imgsz`、`--conf`、`--fps` 等）。
+
+注意：Netflix 等有 DRM 保護的影片，在某些瀏覽器擷取到的會是黑畫面，這時偵測不到人；YouTube 一般沒有這個問題。
+
 ## 跑不到 60 FPS？
 
 1. 確認啟動時印出的是 `CUDA - 你的顯卡`，不是 CPU。

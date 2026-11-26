@@ -2,4 +2,5 @@ dxcam
 ultralytics
 opencv-python
 numpy
+PySide6
 # PyTorch 請另外安裝 CUDA 版本（見 README），RTX 50 系列要用 cu128
