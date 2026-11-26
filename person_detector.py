@@ -52,7 +52,7 @@ def build_parser():
     p.add_argument("--ignore", type=float, nargs=4, action="append",
                    metavar=("X1", "Y1", "X2", "Y2"),
                    help="忽略區域（用畫面比例 0~1 表示）：框的中心落在這裡就不顯示。可以寫多次。"
-                        "預設是左下角 0 0.78 0.45 1（遊戲介面的血量小人）")
+                        "預設是左下角兩塊：0 0.65 0.11 1 和 0 0.78 0.45 1（遊戲介面的血量小人）")
     p.add_argument("--no-ignore", action="store_true", help="不使用任何忽略區域")
     p.add_argument("--keep-self", action="store_true",
                    help="不要過濾第一人稱畫面下方的手（預設會過濾）")
@@ -206,7 +206,10 @@ class BoxTracker:
         return out.round().astype(np.int32), self.conf.copy()
 
 
-DEFAULT_IGNORE = [(0.0, 0.78, 0.45, 1.0)]  # 左下角
+DEFAULT_IGNORE = [
+    (0.0, 0.65, 0.11, 1.0),   # 左下角（使用者指定的範圍）
+    (0.0, 0.78, 0.45, 1.0),   # 左下方遊戲介面的血量小人
+]
 
 
 def filter_ignore(xyxy, confs, h, w, regions):
