@@ -2,6 +2,8 @@
 螢幕疊加版人物偵測：不開預覽視窗，綠框直接畫在螢幕上（例如看 YouTube 影片時）。
 
 - 透明、置頂、滑鼠點得穿的視窗蓋在整個螢幕上，只畫框。
+- 偵測和疊加視窗分成兩個獨立的程式（process）跑，互不拖慢：
+  主程式負責擷取 + 偵測，子程式只負責畫框，兩者用 Pipe 傳框的座標。
 - 透明的做法是「色鍵」：視窗裡純黑色的像素會被 Windows 當成透明。
   每幀只重畫框的邊線那幾條細長區域，不用整個 4K 畫面搬來搬去，所以很省。
 - 預設：疊加視窗會被排除在螢幕擷取之外，所以框不會被下一幀再偵測到，
@@ -18,17 +20,18 @@
 """
 
 import ctypes
+import multiprocessing as mp
 import signal
 import sys
 import time
 from ctypes import wintypes
 
-import dxcam
-from PySide6.QtCore import QRect, Qt, QThread, QTimer, Signal
+from PySide6.QtCore import QRect, Qt, QTimer
 from PySide6.QtGui import QColor, QFont, QGuiApplication, QPainter, QPen, QRegion
 from PySide6.QtWidgets import QApplication, QWidget
 
-from person_detector import build_parser, Detector, compute_region, exclude_hwnd_from_capture
+# 偵測相關的套件（torch、ultralytics、dxcam）只在主程式載入，
+# 疊加視窗的子程式不需要，載入會白白多花好幾秒和記憶體。
 
 BOX_COLOR = QColor(0, 255, 0)
 KEY_COLOR = QColor(0, 0, 0)          # 純黑 = 透明，畫面上其他地方都不能用純黑
@@ -63,63 +66,56 @@ def apply_color_key(hwnd):
     return bool(ok) and bool(flags.value & LWA_COLORKEY) and key.value == 0
 
 
-class DetectorThread(QThread):
-    """背景執行緒：擷取螢幕 → 偵測 → 把框（螢幕實體像素座標）送給疊加視窗。"""
+def run_detection(args, conn):
+    """主程式：擷取螢幕 → 偵測 → 把框（螢幕實體像素座標）送給疊加視窗子程式。"""
+    import dxcam
+    from person_detector import Detector, compute_region
 
-    detections = Signal(object, float)  # (list[(x1, y1, x2, y2, conf)], fps)
+    detector = Detector(args)
+    camera = dxcam.create(output_idx=args.monitor, output_color="BGR")
+    region = compute_region(args, camera.width, camera.height)
+    left, top = region[0], region[1]
+    print(f"[資訊] 螢幕 {camera.width}x{camera.height}，擷取區域 {region}，目標 {args.fps} FPS")
+    camera.start(region=region, target_fps=args.fps, video_mode=True)
+    print("[資訊] 開始偵測。要結束請在這個視窗按 Ctrl + C")
 
-    def __init__(self, args):
-        super().__init__()
-        self.args = args
-        self._running = True
-
-    def stop(self):
-        self._running = False
-
-    def run(self):
-        args = self.args
-        # 模型和擷取都在這個執行緒裡建立，避免跨執行緒使用 CUDA / TensorRT
-        detector = Detector(args)
-        camera = dxcam.create(output_idx=args.monitor, output_color="BGR")
-        region = compute_region(args, camera.width, camera.height)
-        left, top = region[0], region[1]
-        print(f"[資訊] 螢幕 {camera.width}x{camera.height}，擷取區域 {region}，目標 {args.fps} FPS")
-        camera.start(region=region, target_fps=args.fps, video_mode=True)
-        print("[資訊] 開始偵測。要結束請在這個視窗按 Ctrl + C")
-
-        fps_ema = 0.0
-        last = last_print = time.perf_counter()
-        t_cap = t_inf = 0.0
-        n = 0
-        try:
-            while self._running:
-                t0 = time.perf_counter()
-                frame = camera.get_latest_frame()
-                if frame is None:
-                    continue
-                t1 = time.perf_counter()
-                xyxy, confs = detector(frame)
-                boxes = [(x1 + left, y1 + top, x2 + left, y2 + top, float(c))
-                         for (x1, y1, x2, y2), c in zip(xyxy, confs)]
-                now = time.perf_counter()
-                t_cap += t1 - t0
-                t_inf += now - t1
-                n += 1
-                dt = now - last
-                last = now
-                fps_ema = (1.0 / dt) if fps_ema == 0 else fps_ema * 0.9 + (1.0 / dt) * 0.1
-                self.detections.emit(boxes, fps_ema)
-                if now - last_print >= 1.0:
-                    print(f"FPS {fps_ema:5.1f} | 擷取等待 {t_cap / n * 1000:5.1f} ms"
-                          f" | 偵測 {t_inf / n * 1000:5.1f} ms | 人數 {len(boxes)}")
-                    t_cap = t_inf = 0.0
-                    n = 0
-                    last_print = now
-        finally:
-            camera.stop()
-            del camera
-            # 清掉螢幕上殘留的框
-            self.detections.emit([], -1.0)
+    fps_ema = 0.0
+    last = last_print = time.perf_counter()
+    t_cap = t_inf = 0.0
+    n = 0
+    try:
+        while True:
+            t0 = time.perf_counter()
+            frame = camera.get_latest_frame()
+            if frame is None:
+                continue
+            t1 = time.perf_counter()
+            xyxy, confs = detector(frame)
+            boxes = [(int(x1) + left, int(y1) + top, int(x2) + left, int(y2) + top, float(c))
+                     for (x1, y1, x2, y2), c in zip(xyxy, confs)]
+            now = time.perf_counter()
+            t_cap += t1 - t0
+            t_inf += now - t1
+            n += 1
+            dt = now - last
+            last = now
+            fps_ema = (1.0 / dt) if fps_ema == 0 else fps_ema * 0.9 + (1.0 / dt) * 0.1
+            try:
+                conn.send((boxes, fps_ema))
+            except (BrokenPipeError, OSError):
+                print("[資訊] 疊加視窗已關閉")
+                break
+            if now - last_print >= 1.0:
+                print(f"FPS {fps_ema:5.1f} | 擷取等待 {t_cap / n * 1000:5.1f} ms"
+                      f" | 偵測 {t_inf / n * 1000:5.1f} ms | 人數 {len(boxes)}")
+                t_cap = t_inf = 0.0
+                n = 0
+                last_print = now
+    except KeyboardInterrupt:
+        pass
+    finally:
+        camera.stop()
+        del camera
 
 
 class Overlay(QWidget):
@@ -222,45 +218,84 @@ def pick_screen(index):
     return screens[index] if index < len(screens) else QGuiApplication.primaryScreen()
 
 
-def main():
-    parser = build_parser()
-    parser.add_argument("--recordable", action="store_true",
-                        help="讓錄影軟體也錄得到框（框也會被偵測程式看到）")
-    args = parser.parse_args()
+def exclude_hwnd_from_capture(hwnd):
+    """讓視窗不被螢幕擷取（需要 Windows 10 2004 以上）。"""
+    WDA_EXCLUDEFROMCAPTURE = 0x00000011
+    if not ctypes.windll.user32.SetWindowDisplayAffinity(wintypes.HWND(hwnd), WDA_EXCLUDEFROMCAPTURE):
+        print("[警告] 排除擷取失敗，框可能會被擷取到")
+
+
+def overlay_process(conn, monitor, recordable, ready):
+    """子程式：只負責透明疊加視窗，從 Pipe 收框來畫。"""
+    signal.signal(signal.SIGINT, signal.SIG_IGN)  # Ctrl + C 交給主程式處理
 
     app = QApplication(sys.argv)
-    overlay = Overlay(pick_screen(args.monitor))
+    overlay = Overlay(pick_screen(monitor))
     hwnd = int(overlay.winId())  # 先建立視窗（還不顯示）
     if not apply_color_key(hwnd):
         print("[錯誤] 無法設定透明疊加視窗，程式結束")
+        ready.set()
         return
     overlay.show()
     if not apply_color_key(hwnd):  # 顯示後再確認一次，失敗就立刻關掉，避免黑畫面蓋住螢幕
         overlay.close()
         print("[錯誤] 無法設定透明疊加視窗，程式結束")
+        ready.set()
         return
-    if args.recordable:
+    if recordable:
         print("[資訊] 可錄影模式：錄影軟體錄得到框")
     else:
         exclude_hwnd_from_capture(hwnd)
+    ready.set()
 
-    worker = DetectorThread(args)
-    worker.detections.connect(overlay.set_boxes)  # 跨執行緒，Qt 會自動排到主執行緒執行
-    worker.finished.connect(app.quit)
+    def poll():
+        latest = None
+        try:
+            while conn.poll():  # 一次把累積的訊息讀完，只畫最新的一筆
+                latest = conn.recv()
+                if latest is None:
+                    app.quit()
+                    return
+        except (EOFError, OSError):
+            app.quit()
+            return
+        if latest is not None:
+            overlay.set_boxes(*latest)
 
-    def shutdown(*_):
-        worker.stop()
-
-    signal.signal(signal.SIGINT, shutdown)
-    # Qt 事件迴圈執行時 Python 收不到 Ctrl + C，用計時器讓它定期醒來處理
-    keepalive = QTimer()
-    keepalive.timeout.connect(lambda: None)
-    keepalive.start(200)
-
-    worker.start()
+    timer = QTimer()
+    timer.timeout.connect(poll)
+    timer.start(2)
     app.exec()
-    worker.stop()
-    worker.wait()
+
+
+def main():
+    from person_detector import build_parser
+
+    parser = build_parser()
+    parser.add_argument("--recordable", action="store_true",
+                        help="讓錄影軟體也錄得到框（框也會被偵測程式看到）")
+    args = parser.parse_args()
+
+    recv_conn, send_conn = mp.Pipe(duplex=False)
+    ready = mp.Event()
+    proc = mp.Process(target=overlay_process,
+                      args=(recv_conn, args.monitor, args.recordable, ready), daemon=True)
+    proc.start()
+    ready.wait(timeout=30)
+    if not proc.is_alive():
+        print("[錯誤] 疊加視窗沒有啟動成功")
+        return
+
+    try:
+        run_detection(args, send_conn)
+    finally:
+        try:
+            send_conn.send(None)  # 通知疊加視窗關閉
+        except (BrokenPipeError, OSError):
+            pass
+        proc.join(timeout=3)
+        if proc.is_alive():
+            proc.terminate()
 
 
 if __name__ == "__main__":
