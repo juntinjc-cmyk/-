@@ -21,7 +21,7 @@ import time
 
 import dxcam
 from PySide6.QtCore import QRect, Qt, QThread, QTimer, Signal
-from PySide6.QtGui import QColor, QFont, QGuiApplication, QPainter, QPen
+from PySide6.QtGui import QColor, QFont, QGuiApplication, QPainter, QPen, QRegion
 from PySide6.QtWidgets import QApplication, QWidget
 
 from person_detector import build_parser, compute_region, exclude_hwnd_from_capture, load_model
@@ -56,23 +56,33 @@ class DetectorThread(QThread):
 
         fps_ema = 0.0
         last = last_print = time.perf_counter()
+        t_cap = t_inf = 0.0
+        n = 0
         try:
             while self._running:
+                t0 = time.perf_counter()
                 frame = camera.get_latest_frame()
                 if frame is None:
                     continue
+                t1 = time.perf_counter()
                 result = model.predict(frame, **pred_kwargs)[0]
                 xyxy = result.boxes.xyxy.cpu().numpy().astype(int)
                 confs = result.boxes.conf.cpu().numpy()
                 boxes = [(x1 + left, y1 + top, x2 + left, y2 + top, float(c))
                          for (x1, y1, x2, y2), c in zip(xyxy, confs)]
                 now = time.perf_counter()
+                t_cap += t1 - t0
+                t_inf += now - t1
+                n += 1
                 dt = now - last
                 last = now
                 fps_ema = (1.0 / dt) if fps_ema == 0 else fps_ema * 0.9 + (1.0 / dt) * 0.1
                 self.detections.emit(boxes, fps_ema)
                 if now - last_print >= 1.0:
-                    print(f"FPS {fps_ema:5.1f} | 人數 {len(boxes)}")
+                    print(f"FPS {fps_ema:5.1f} | 擷取等待 {t_cap / n * 1000:5.1f} ms"
+                          f" | 偵測 {t_inf / n * 1000:5.1f} ms | 人數 {len(boxes)}")
+                    t_cap = t_inf = 0.0
+                    n = 0
                     last_print = now
         finally:
             camera.stop()
@@ -94,11 +104,29 @@ class Overlay(QWidget):
         self.setGeometry(screen.geometry())
         self.boxes = []
         self.fps = -1.0
+        self._dirty = QRegion()
+
+    def _region_for(self, boxes):
+        """算出這些框（含標籤）和左上角 FPS 佔用的範圍，換成 Qt 的邏輯座標。"""
+        dpr = self.devicePixelRatioF()
+        pad = 6
+        label_h = 40
+        region = QRegion()
+        rects = [(20, 20, 20 + 700, 20 + 70)]  # 左上角 FPS 區塊
+        rects += [(x1, y1 - label_h, max(x2, x1 + 260), y2) for x1, y1, x2, y2, _ in boxes]
+        for x1, y1, x2, y2 in rects:
+            region += QRect(int((x1 - pad) / dpr), int((y1 - pad) / dpr),
+                            int((x2 - x1 + 2 * pad) / dpr) + 2, int((y2 - y1 + 2 * pad) / dpr) + 2)
+        return region
 
     def set_boxes(self, boxes, fps):
         self.boxes = boxes
         self.fps = fps
-        self.update()  # 觸發重畫
+        # 只重畫「舊的框 + 新的框」所在的範圍，不要每次重畫整個 4K 螢幕，
+        # 否則透明全螢幕視窗每幀都要搬 30 多 MB 的畫面，會拖慢速度。
+        new_dirty = self._region_for(boxes)
+        self.update(self._dirty + new_dirty)
+        self._dirty = new_dirty
 
     def paintEvent(self, _event):
         p = QPainter(self)
