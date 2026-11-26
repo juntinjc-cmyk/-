@@ -82,6 +82,7 @@ def run_detection(args, conn):
     fps_ema = 0.0
     last = last_print = time.perf_counter()
     t_cap = t_inf = 0.0
+    sp = {"preprocess": 0.0, "inference": 0.0, "postprocess": 0.0}
     n = 0
     try:
         while True:
@@ -96,6 +97,8 @@ def run_detection(args, conn):
             now = time.perf_counter()
             t_cap += t1 - t0
             t_inf += now - t1
+            for k in sp:
+                sp[k] += detector.speed.get(k) or 0.0
             n += 1
             dt = now - last
             last = now
@@ -107,8 +110,11 @@ def run_detection(args, conn):
                 break
             if now - last_print >= 1.0:
                 print(f"FPS {fps_ema:5.1f} | 擷取等待 {t_cap / n * 1000:5.1f} ms"
-                      f" | 偵測 {t_inf / n * 1000:5.1f} ms | 人數 {len(boxes)}")
+                      f" | 偵測 {t_inf / n * 1000:5.1f} ms"
+                      f"（前處理 {sp['preprocess'] / n:4.1f} / 推論 {sp['inference'] / n:4.1f}"
+                      f" / 後處理 {sp['postprocess'] / n:4.1f}） | 人數 {len(boxes)}")
                 t_cap = t_inf = 0.0
+                sp = dict.fromkeys(sp, 0.0)
                 n = 0
                 last_print = now
     except KeyboardInterrupt:
@@ -190,7 +196,7 @@ class Overlay(QWidget):
             p.setBrush(Qt.NoBrush)
             p.drawRect(x1, y1, x2 - x1, y2 - y1)
 
-            label = f"person {c:.2f}"
+            label = "person"
             tw, th = fm.horizontalAdvance(label) + 8, fm.height() + 4
             ty = max(y1 - th, 0)
             p.fillRect(QRect(x1, ty, tw, th), BOX_COLOR)

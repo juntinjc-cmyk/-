@@ -82,7 +82,7 @@ def exclude_window_from_capture(title):
 def draw_boxes(frame, boxes, confs):
     for (x1, y1, x2, y2), c in zip(boxes, confs):
         cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 255, 0), 2)
-        label = f"person {c:.2f}"
+        label = "person"
         (tw, th), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 1)
         y_text = max(y1, th + 4)
         cv2.rectangle(frame, (x1, y_text - th - 4), (x1 + tw + 4, y_text), (0, 255, 0), -1)
@@ -163,6 +163,7 @@ class Detector:
             self(dummy)
 
     def __call__(self, frame):
+        """self.speed 會記錄 ultralytics 內部的「前處理 / 推論 / 後處理」毫秒數。"""
         if self.pre is not None:
             x, r = self.pre(frame)
             res = self.model.predict(x, **self.kwargs)[0]
@@ -170,6 +171,7 @@ class Detector:
         else:
             res = self.model.predict(frame, **self.kwargs)[0]
             xyxy = res.boxes.xyxy.cpu().numpy().astype(int)
+        self.speed = res.speed
         return xyxy, res.boxes.conf.cpu().numpy()
 
 
@@ -195,6 +197,7 @@ def main():
     last_print = last
     # 每秒統計各階段平均花多少毫秒，用來找出是哪裡拖慢 FPS
     t_cap = t_inf = t_show = 0.0
+    sp = {"preprocess": 0.0, "inference": 0.0, "postprocess": 0.0}
     n = 0
 
     try:
@@ -224,6 +227,8 @@ def main():
 
             t_cap += t1 - t0
             t_inf += t2 - t1
+            for k in sp:
+                sp[k] += detector.speed.get(k) or 0.0
             t_show += t3 - t2
             n += 1
 
@@ -234,8 +239,11 @@ def main():
             if t3 - last_print >= 1.0:
                 print(f"FPS {fps_ema:5.1f} | 擷取等待 {t_cap / n * 1000:5.1f} ms"
                       f" | 偵測 {t_inf / n * 1000:5.1f} ms"
+                      f"（前處理 {sp['preprocess'] / n:4.1f} / 推論 {sp['inference'] / n:4.1f}"
+                      f" / 後處理 {sp['postprocess'] / n:4.1f}）"
                       f" | 畫框顯示 {t_show / n * 1000:5.1f} ms | 人數 {len(boxes)}")
                 t_cap = t_inf = t_show = 0.0
+                sp = dict.fromkeys(sp, 0.0)
                 n = 0
                 last_print = t3
     except KeyboardInterrupt:
