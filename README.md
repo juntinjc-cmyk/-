@@ -61,7 +61,7 @@ python person_overlay.py --model yolo11n.engine --recordable
 4K 畫面預設被縮到 640 寬才偵測（縮小 6 倍），遠處的人只剩幾個像素就抓不到了。把輸入加大即可，建議用跟螢幕一樣 16:9 的長方形尺寸，不會浪費運算在補黑邊上：
 
 ```bash
-yolo export model=yolo11n.pt format=engine half=True imgsz=736,1280
+yolo export model=yolo11n.pt format=engine half=True imgsz=[736,1280]
 python person_overlay.py --model yolo11n.engine --imgsz 736 1280 --recordable
 ```
 
