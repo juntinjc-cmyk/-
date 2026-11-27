@@ -137,3 +137,19 @@ python person_overlay.py ... --no-ignore                      # 不忽略
 全螢幕擷取時，預覽視窗本身也在螢幕上，正常會出現「畫面套畫面」。程式會用 Windows 的 `SetWindowDisplayAffinity(WDA_EXCLUDEFROMCAPTURE)` 把預覽視窗排除在擷取之外（需要 Windows 10 2004 以上）：你看得到視窗，但偵測畫面裡不會有它。
 
 如果終端機出現「排除擷取失敗」的警告，可以把預覽視窗拖到第二個螢幕，或加 `--no-show`。
+
+## 用自己的畫面微調模型（讓它更準）
+
+適合真實影片（演唱會、樂團、車聚、街拍、運動）。收集到的畫面只留在自己電腦上，不要上傳或公開。
+
+```bash
+# 1. 收集畫面（從影片檔抽，或播放時截螢幕），至少 500~1000 張
+python training/collect_frames.py --video 影片1.mp4 影片2.mp4 --every 2
+python training/collect_frames.py --screen --every 3 --minutes 60
+
+# 2. 用大模型自動標註（可再用 CVAT 等工具手動修正，效果更好）
+python training/auto_label.py
+
+# 3. 訓練 → 比較分數 → 變好才轉成 yolo11s-seg-custom.engine
+python training/train.py
+```
