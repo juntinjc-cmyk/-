@@ -46,6 +46,11 @@ def main():
         if d.exists():
             shutil.rmtree(d)
         d.mkdir(parents=True)
+    # 重新標註後，之前 Gemini 檢查的結果就不適用了
+    for old in ("review_cache.json", "review_missed.txt"):
+        (out / old).unlink(missing_ok=True)
+    if (out / "labels_backup").exists():
+        shutil.rmtree(out / "labels_backup")
 
     random.seed(0)
     order = imgs[:]
@@ -81,7 +86,8 @@ def main():
             "  0: person\n")
     (out / "data.yaml").write_text(yaml, encoding="utf-8")
     print(f"[完成] 共標了 {people} 個人；沒有人的圖 {empty} 張（也會用來教模型「這裡沒有人」）")
-    print(f"[完成] 設定檔：{out / 'data.yaml'}。下一步：python training/train.py")
+    print(f"[完成] 設定檔：{out / 'data.yaml'}")
+    print("[下一步] （可選）python training/review_labels.py 用 Gemini 檢查，然後 python training/train.py")
 
 
 if __name__ == "__main__":

@@ -2,5 +2,6 @@ dxcam
 ultralytics
 opencv-python
 numpy
+# 可選：python training/review_labels.py 需要 google-genai
 PySide6
 # PyTorch 請另外安裝 CUDA 版本（見 README），RTX 50 系列要用 cu128

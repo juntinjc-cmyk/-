@@ -150,6 +150,10 @@ python training/collect_frames.py --screen --every 3 --minutes 60
 # 2. 用大模型自動標註（可再用 CVAT 等工具手動修正，效果更好）
 python training/auto_label.py
 
+# 2.5（可選）用 Gemini 檢查標註：刪掉不是真人的、列出可能漏標的圖片
+#      需要 pip install google-genai，並設定環境變數 GEMINI_API_KEY（只用一個帳號，依免費額度慢慢跑）
+python training/review_labels.py
+
 # 3. 訓練 → 比較分數 → 變好才轉成 yolo11s-seg-custom.engine
 python training/train.py
 ```
